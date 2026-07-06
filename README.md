@@ -31,17 +31,62 @@ On Windows, tick **"Add Python to PATH"** in the installer.
 
 ## 2. Install Python dependencies
 
-Only one required package:
-
 ```bash
-pip install yt-dlp
+pip install -U "yt-dlp[default]" rich
 ```
 
-Upgrade later with:
+- `yt-dlp` — the downloader
+- `rich` — pretty terminal UI (panels, colors, progress bar)
 
+Upgrade later with the same command.
+
+---
+
+## 2b. (Highly recommended) Install a JS runtime — Deno
+
+YouTube now requires running a JavaScript challenge. Without a JS runtime,
+yt-dlp fails with **"Sign in to confirm you're not a bot"** on many videos.
+Install **Deno** (yt-dlp picks it up automatically):
+
+### Linux / macOS
 ```bash
-pip install -U yt-dlp
+curl -fsSL https://deno.land/install.sh | sh
 ```
+
+### Windows (PowerShell)
+```powershell
+irm https://deno.land/install.ps1 | iex
+```
+
+Verify:
+```bash
+deno --version
+```
+
+---
+
+## 2c. Cookies (fixes "Sign in to confirm you're not a bot")
+
+The script now auto-detects usable browser cookie databases and a local
+`cookies.txt` file. If `cookies.txt` exists but is not in the required
+**Netscape cookies.txt** format, the script rejects it before downloading.
+
+For Codespaces / cloud terminals, browser cookies usually do not exist on
+the server. Export cookies on your own computer instead:
+
+1. Log in to YouTube in Chrome / Edge / Brave / Firefox.
+2. Install **Get cookies.txt LOCALLY** or another exporter that supports
+   **Netscape** format.
+3. Open `youtube.com`, export cookies as `cookies.txt`.
+4. Upload/put `cookies.txt` in this project folder.
+5. Run:
+   ```bash
+   python youtube_playlist_downloader.py
+   ```
+
+Do **not** paste JSON cookies or browser DevTools output — yt-dlp needs
+7 TAB-separated Netscape cookie columns.
+
 
 ---
 
@@ -127,12 +172,17 @@ Then the download starts. Use `p` / `r` / `c` in the terminal to control it.
 
 | Problem | Fix |
 |---|---|
-| `yt-dlp is not installed` | Run `pip install yt-dlp` |
+| `yt-dlp is not installed` | Run `pip install "yt-dlp[default]"` |
+| `Missing dependency 'rich'` | Run `pip install rich` |
+| **`Sign in to confirm you're not a bot`** | Install **Deno** (step 2b) and use a valid Netscape-format `cookies.txt` from a browser where YouTube is logged in |
+| `cookies.txt does not look like a Netscape format cookies file` | Re-export cookies with **Get cookies.txt LOCALLY** in **Netscape** format; do not use JSON/DevTools cookies |
 | Downloads stuck at 360p | Install **FFmpeg** and make sure it's on PATH |
 | Folder picker doesn't open | Install Tk: `sudo apt install python3-tk` (Linux). Falls back to typed path. |
 | `HTTP Error 403 / 429` | Update yt-dlp: `pip install -U yt-dlp` |
 | Slow downloads | Install **aria2c** (see step 4) |
+| Cookies from browser fail with "database is locked" | Fully close the browser first, then retry |
 | Hotkeys don't work | Run in a real terminal, not inside an IDE's read-only output pane |
+
 
 ---
 
