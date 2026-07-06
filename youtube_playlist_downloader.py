@@ -143,6 +143,19 @@ def ask_mode() -> str:
     return {"1": "single", "2": "multiple", "3": "playlist"}[choice]
 
 
+def ask_media_type() -> str:
+    """Ask if the user wants video+audio or audio-only (mp3)."""
+    console.print(Panel.fit(
+        "[bold]What kind of file do you want?[/]\n"
+        "  [bold]1[/] Video + Audio (mp4)\n"
+        "  [bold]2[/] Audio only (mp3)",
+        title="🎧 Media type", border_style="cyan",
+    ))
+    choice = Prompt.ask("[bold cyan]▸ Choose[/]", choices=["1", "2"], default="1")
+    return "audio" if choice == "2" else "video"
+
+
+
 def ask_playlist_url() -> str:
     while True:
         url = Prompt.ask("[bold cyan]▸ YouTube playlist link[/]").strip()
@@ -777,6 +790,7 @@ def main() -> None:
     show_banner()
 
     mode = ask_mode()  # "single" | "multiple" | "playlist"
+    media_type = ask_media_type()  # "video" | "audio"
     cookie_opts = ask_cookie_source()
 
     # -------- gather URLs + a display title based on mode --------
@@ -829,33 +843,37 @@ def main() -> None:
         first_url = urls[0]
         download_targets = urls
 
-    console.print("[cyan]Probing available resolutions…[/]")
-    resolutions: list[int] = []
-    try:
-        with YoutubeDL({"quiet": True, "skip_download": True, **cookie_opts}) as ydl:
-            probe = ydl.extract_info(first_url, download=False)
-        resolutions = collect_available_resolutions([probe])
-    except DownloadError as e:
-        if _looks_like_bot_challenge(e):
-            _print_cookie_help("Format probe blocked")
-            return
-        console.print(Panel(
-            f"[red]Could not probe formats:[/]\n{e}\n\n"
-            "[yellow]Tip:[/] pick a browser cookie source if you skipped it, "
-            "and install [bold]deno[/] so yt-dlp can run YouTube's JS challenge.",
-            border_style="red", title="⚠ Format probe failed",
-        ))
-        if not Prompt.ask("Continue with 'best available' anyway?", choices=["y", "n"], default="y") == "y":
-            return
+    chosen = 0
+    if media_type == "video":
+        console.print("[cyan]Probing available resolutions…[/]")
+        resolutions: list[int] = []
+        try:
+            with YoutubeDL({"quiet": True, "skip_download": True, **cookie_opts}) as ydl:
+                probe = ydl.extract_info(first_url, download=False)
+            resolutions = collect_available_resolutions([probe])
+        except DownloadError as e:
+            if _looks_like_bot_challenge(e):
+                _print_cookie_help("Format probe blocked")
+                return
+            console.print(Panel(
+                f"[red]Could not probe formats:[/]\n{e}\n\n"
+                "[yellow]Tip:[/] pick a browser cookie source if you skipped it, "
+                "and install [bold]deno[/] so yt-dlp can run YouTube's JS challenge.",
+                border_style="red", title="⚠ Format probe failed",
+            ))
+            if not Prompt.ask("Continue with 'best available' anyway?", choices=["y", "n"], default="y") == "y":
+                return
+        chosen = ask_resolution(resolutions)
 
-    chosen = ask_resolution(resolutions)
     out_dir = ask_save_folder(title)
     ask_browser_download(out_dir)
 
-    fmt = (
-        "bestvideo+bestaudio/best" if chosen == 0
-        else f"bestvideo[height<={chosen}]+bestaudio/best[height<={chosen}]"
-    )
+    if media_type == "audio":
+        fmt = "bestaudio/best"
+    elif chosen == 0:
+        fmt = "bestvideo+bestaudio/best"
+    else:
+        fmt = f"bestvideo[height<={chosen}]+bestaudio/best[height<={chosen}]"
 
     if mode == "playlist":
         outtmpl = os.path.join(out_dir, "%(playlist_index)s - %(title)s.%(ext)s")
@@ -865,34 +883,52 @@ def main() -> None:
     ydl_opts = {
         "format": fmt,
         "outtmpl": outtmpl,
-        "merge_output_format": "mp4",
         "ignoreerrors": True,
         "noprogress": True,
         "quiet": True,
         "no_warnings": True,
-        "concurrent_fragment_downloads": 16,
-        "retries": 10,
-        "fragment_retries": 10,
+        "concurrent_fragment_downloads": 8,
+        "retries": 20,
+        "fragment_retries": 20,
         "progress_hooks": [progress_hook],
         "postprocessor_hooks": [postprocessor_hook],
         **cookie_opts,
     }
+    if media_type == "audio":
+        ydl_opts["postprocessors"] = [{
+            "key": "FFmpegExtractAudio",
+            "preferredcodec": "mp3",
+            "preferredquality": "192",
+        }]
+    else:
+        ydl_opts["merge_output_format"] = "mp4"
+
     if mode == "playlist":
         ydl_opts["playlist_items"] = f"1-{count}"
     else:
         ydl_opts["noplaylist"] = True
 
+    # aria2c: YouTube's CDN rate-limits high per-host connection counts
+    # (503 errors + aria2c exit 29). Keep it modest and retry aggressively
+    # so a single failed fragment doesn't leave you with video-but-no-audio.
     if shutil.which("aria2c"):
         ydl_opts["external_downloader"] = "aria2c"
         ydl_opts["external_downloader_args"] = [
-            "-x", "16", "-s", "16", "-k", "1M", "--summary-interval=0",
+            "-x", "4", "-s", "4", "-k", "1M",
+            "--max-tries=10", "--retry-wait=3",
+            "--max-connection-per-server=4",
+            "--console-log-level=warn", "--summary-interval=0",
+            "--allow-overwrite=true", "--auto-file-renaming=false",
         ]
         console.print("[green]✓ aria2c detected[/] — using multi-connection downloader.")
 
+
+
+    quality_label = "audio (mp3)" if media_type == "audio" else f"{chosen}p" if chosen else "best"
     console.print(Panel.fit(
         f"[bold]Saving to:[/] [green]{out_dir}[/]\n"
-        f"[bold]Mode:[/] {mode}   [bold]Videos:[/] {count}   "
-        f"[bold]Resolution:[/] {chosen or 'best'}   "
+        f"[bold]Mode:[/] {mode}   [bold]Type:[/] {media_type}   [bold]Items:[/] {count}   "
+        f"[bold]Quality:[/] {quality_label}   "
         f"[bold]Cookies:[/] {'yes' if cookie_opts else 'no'}\n"
         "[dim]Hotkeys:[/]  [bold]p[/] pause   [bold]r[/] resume   [bold]c[/] cancel",
         border_style="cyan", title="⬇ Download",
