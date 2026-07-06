@@ -130,12 +130,92 @@ def show_banner() -> None:
 
 
 # ---------- prompts ----------
+def ask_mode() -> str:
+    """Ask user what they want to download: single, multiple, or playlist."""
+    console.print(Panel.fit(
+        "[bold]What do you want to download?[/]\n"
+        "  [bold]1[/] Single video\n"
+        "  [bold]2[/] Multiple videos (not from a playlist)\n"
+        "  [bold]3[/] Playlist",
+        title="🎯 Mode", border_style="cyan",
+    ))
+    choice = Prompt.ask("[bold cyan]▸ Choose[/]", choices=["1", "2", "3"], default="3")
+    return {"1": "single", "2": "multiple", "3": "playlist"}[choice]
+
+
 def ask_playlist_url() -> str:
     while True:
         url = Prompt.ask("[bold cyan]▸ YouTube playlist link[/]").strip()
         if url:
             return url
         console.print("[red]Please enter a valid URL.[/]")
+
+
+def ask_single_url() -> str:
+    while True:
+        url = Prompt.ask("[bold cyan]▸ YouTube video link[/]").strip()
+        if url:
+            return url
+        console.print("[red]Please enter a valid URL.[/]")
+
+
+def ask_multiple_urls() -> list[str]:
+    """Ask how many videos, then collect that many URLs.
+
+    Sub-mode 1: paste them one-by-one (press Enter after each).
+    Sub-mode 2: paste all at once separated by comma, space, or newline.
+    """
+    while True:
+        raw = Prompt.ask("[bold cyan]▸ How many videos?[/]").strip()
+        if raw.isdigit() and int(raw) >= 1:
+            count = int(raw)
+            break
+        console.print("[red]Enter a positive number.[/]")
+
+    console.print(Panel.fit(
+        "[bold]How do you want to paste the links?[/]\n"
+        "  [bold]1[/] One by one (paste a link, press Enter, repeat)\n"
+        "  [bold]2[/] All at once (separated by comma, space, or newline)",
+        border_style="cyan", title="🔗 Input style",
+    ))
+    style = Prompt.ask("[bold cyan]▸ Choose[/]", choices=["1", "2"], default="1")
+
+    urls: list[str] = []
+    if style == "1":
+        for i in range(1, count + 1):
+            while True:
+                url = Prompt.ask(f"[bold cyan]▸ Link {i}/{count}[/]").strip()
+                if url:
+                    urls.append(url)
+                    break
+                console.print("[red]Empty — try again.[/]")
+    else:
+        console.print(f"[dim]Paste all {count} links (comma / space / newline separated).[/]")
+        console.print("[dim]End with an empty line:[/]")
+        buf: list[str] = []
+        while True:
+            try:
+                line = input()
+            except EOFError:
+                break
+            if line == "":
+                if buf:
+                    break
+                continue
+            buf.append(line)
+        import re
+        tokens = [t.strip() for t in re.split(r"[\s,]+", "\n".join(buf)) if t.strip()]
+        if len(tokens) < count:
+            console.print(f"[yellow]Got {len(tokens)} links, expected {count}. Using what was pasted.[/]")
+        elif len(tokens) > count:
+            console.print(f"[yellow]Got {len(tokens)} links, using first {count}.[/]")
+            tokens = tokens[:count]
+        urls = tokens
+
+    if not urls:
+        console.print("[red]No links provided.[/]")
+        sys.exit(1)
+    return urls
 
 
 def ask_video_count(total: int) -> int:
@@ -151,6 +231,7 @@ def ask_video_count(total: int) -> int:
             if 1 <= n <= total:
                 return n
         console.print("[red]Invalid input, try again.[/]")
+
 
 
 def _has_chromium_cookie_db(root: Path) -> bool:
@@ -695,45 +776,60 @@ def postprocessor_hook(d: dict) -> None:
 def main() -> None:
     show_banner()
 
-    playlist_url = ask_playlist_url()
+    mode = ask_mode()  # "single" | "multiple" | "playlist"
     cookie_opts = ask_cookie_source()
 
-    def _extract(opts_extra):
-        with YoutubeDL({"quiet": True, "extract_flat": True, "skip_download": True, **opts_extra}) as ydl:
-            return ydl.extract_info(playlist_url, download=False)
+    # -------- gather URLs + a display title based on mode --------
+    if mode == "playlist":
+        playlist_url = ask_playlist_url()
 
-    with console.status("[cyan]Fetching playlist info…[/]", spinner="dots"):
-        try:
-            info = _extract(cookie_opts)
-        except Exception as e:
-            msg = str(e)
-            if cookie_opts and "cookie" in msg.lower():
-                console.print(f"[yellow]⚠ Cookie load failed:[/] {msg.splitlines()[0]}")
-                console.print("[yellow]Retrying without cookies…[/]")
-                cookie_opts = {}
+        def _extract(opts_extra):
+            with YoutubeDL({"quiet": True, "extract_flat": True, "skip_download": True, **opts_extra}) as ydl:
+                return ydl.extract_info(playlist_url, download=False)
+
+        with console.status("[cyan]Fetching playlist info…[/]", spinner="dots"):
+            try:
                 info = _extract(cookie_opts)
-            else:
-                raise
+            except Exception as e:
+                msg = str(e)
+                if cookie_opts and "cookie" in msg.lower():
+                    console.print(f"[yellow]⚠ Cookie load failed:[/] {msg.splitlines()[0]}")
+                    console.print("[yellow]Retrying without cookies…[/]")
+                    cookie_opts = {}
+                    info = _extract(cookie_opts)
+                else:
+                    raise
 
-    entries = info.get("entries") or []
-    if not entries:
-        console.print("[red]No videos found. Is this a valid playlist URL?[/]")
-        sys.exit(1)
+        entries = info.get("entries") or []
+        if not entries:
+            console.print("[red]No videos found. Is this a valid playlist URL?[/]")
+            sys.exit(1)
 
-    total = len(entries)
-    title = info.get("title") or "playlist"
-    console.print(Panel.fit(
-        f"[bold white]{title}[/]\n[dim]{total} videos found[/]",
-        border_style="green", title="📃 Playlist",
-    ))
+        total = len(entries)
+        title = info.get("title") or "playlist"
+        console.print(Panel.fit(
+            f"[bold white]{title}[/]\n[dim]{total} videos found[/]",
+            border_style="green", title="📃 Playlist",
+        ))
+        count = ask_video_count(total)
+        selected = entries[:count]
 
-    count = ask_video_count(total)
-    selected = entries[:count]
+        first_url = selected[0].get("url") or selected[0].get("webpage_url")
+        if first_url and not first_url.startswith("http"):
+            first_url = f"https://www.youtube.com/watch?v={first_url}"
+        download_targets = [playlist_url]
+    else:
+        if mode == "single":
+            urls = [ask_single_url()]
+            title = "video"
+        else:
+            urls = ask_multiple_urls()
+            title = "videos"
+        count = len(urls)
+        first_url = urls[0]
+        download_targets = urls
 
     console.print("[cyan]Probing available resolutions…[/]")
-    first_url = selected[0].get("url") or selected[0].get("webpage_url")
-    if first_url and not first_url.startswith("http"):
-        first_url = f"https://www.youtube.com/watch?v={first_url}"
     resolutions: list[int] = []
     try:
         with YoutubeDL({"quiet": True, "skip_download": True, **cookie_opts}) as ydl:
@@ -745,10 +841,8 @@ def main() -> None:
             return
         console.print(Panel(
             f"[red]Could not probe formats:[/]\n{e}\n\n"
-            "[yellow]Tip:[/] pick a browser cookie source (option 1-6) if you skipped it, "
-            "and install [bold]deno[/] so yt-dlp can run YouTube's JS challenge:\n"
-            "  • Linux/macOS: [cyan]curl -fsSL https://deno.land/install.sh | sh[/]\n"
-            "  • Windows:     [cyan]irm https://deno.land/install.ps1 | iex[/]",
+            "[yellow]Tip:[/] pick a browser cookie source if you skipped it, "
+            "and install [bold]deno[/] so yt-dlp can run YouTube's JS challenge.",
             border_style="red", title="⚠ Format probe failed",
         ))
         if not Prompt.ask("Continue with 'best available' anyway?", choices=["y", "n"], default="y") == "y":
@@ -763,10 +857,14 @@ def main() -> None:
         else f"bestvideo[height<={chosen}]+bestaudio/best[height<={chosen}]"
     )
 
+    if mode == "playlist":
+        outtmpl = os.path.join(out_dir, "%(playlist_index)s - %(title)s.%(ext)s")
+    else:
+        outtmpl = os.path.join(out_dir, "%(title)s.%(ext)s")
+
     ydl_opts = {
         "format": fmt,
-        "outtmpl": os.path.join(out_dir, "%(playlist_index)s - %(title)s.%(ext)s"),
-        "playlist_items": f"1-{count}",
+        "outtmpl": outtmpl,
         "merge_output_format": "mp4",
         "ignoreerrors": True,
         "noprogress": True,
@@ -779,6 +877,10 @@ def main() -> None:
         "postprocessor_hooks": [postprocessor_hook],
         **cookie_opts,
     }
+    if mode == "playlist":
+        ydl_opts["playlist_items"] = f"1-{count}"
+    else:
+        ydl_opts["noplaylist"] = True
 
     if shutil.which("aria2c"):
         ydl_opts["external_downloader"] = "aria2c"
@@ -789,7 +891,7 @@ def main() -> None:
 
     console.print(Panel.fit(
         f"[bold]Saving to:[/] [green]{out_dir}[/]\n"
-        f"[bold]Videos:[/] {count}   "
+        f"[bold]Mode:[/] {mode}   [bold]Videos:[/] {count}   "
         f"[bold]Resolution:[/] {chosen or 'best'}   "
         f"[bold]Cookies:[/] {'yes' if cookie_opts else 'no'}\n"
         "[dim]Hotkeys:[/]  [bold]p[/] pause   [bold]r[/] resume   [bold]c[/] cancel",
@@ -815,7 +917,7 @@ def main() -> None:
         with PSTATE.progress:
             PSTATE.task_id = PSTATE.progress.add_task("[cyan]starting…", total=1)
             with YoutubeDL(ydl_opts) as ydl:
-                ydl.download([playlist_url])
+                ydl.download(download_targets)
     except CancelledByUser:
         console.print("[red]■ Download cancelled.[/]")
         return
@@ -834,44 +936,76 @@ def main() -> None:
             border_style="green",
         ))
 
-    # Bundle everything into a single ZIP and give the user one link.
     if BRIDGE.enabled:
         files = [f for f in BRIDGE.files if os.path.exists(f)]
-        # Fallback: if no files were tracked (e.g. hook path issues), scan out_dir.
         if not files and os.path.isdir(out_dir):
             for root, _, fnames in os.walk(out_dir):
                 for fn in fnames:
                     if not fn.endswith((".part", ".ytdl")):
                         files.append(os.path.join(root, fn))
 
-        zip_link = None
-        if files:
-            import zipfile
-            zip_name = os.path.basename(out_dir.rstrip(os.sep)) or "downloads"
-            zip_path = os.path.join(os.path.dirname(out_dir) or ".", f"{zip_name}.zip")
-            try:
-                with console.status(f"[cyan]Packing {len(files)} file(s) into ZIP…[/]", spinner="dots"):
-                    with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_STORED, allowZip64=True) as zf:
-                        for fp in files:
-                            arc = os.path.relpath(fp, os.path.dirname(out_dir) or ".")
-                            zf.write(fp, arcname=arc)
-                zip_link = BRIDGE.url_for(zip_path)
-                size_mb = os.path.getsize(zip_path) / (1024 * 1024)
+        if mode == "single":
+            # No ZIP for a single video — direct link only.
+            if files:
+                lines = []
+                for fp in files:
+                    size_mb = os.path.getsize(fp) / (1024 * 1024)
+                    link = BRIDGE.url_for(fp)
+                    lines.append(
+                        f"[white]{os.path.basename(fp)}[/] [dim]({size_mb:.1f} MB)[/]\n"
+                        f"  [cyan][link={link}]{link}[/link][/]"
+                    )
                 console.print(Panel.fit(
-                    f"[bold green]📦 ZIP ready:[/] [white]{os.path.basename(zip_path)}[/] "
-                    f"[dim]({size_mb:.1f} MB, {len(files)} files)[/]\n"
-                    f"[bold]⬇ Click to download all at once:[/]\n"
-                    f"  [cyan][link={zip_link}]{zip_link}[/link][/]",
-                    title="🎁 One-click download", border_style="green",
+                    "[bold]⬇ Click to download to your PC:[/]\n" + "\n".join(lines),
+                    title="🎁 Your video", border_style="green",
                 ))
-            except Exception as e:
-                console.print(f"[yellow]⚠ Could not build ZIP:[/] {e}")
+            else:
+                console.print("[yellow]No file found to link.[/]")
         else:
-            console.print("[yellow]No files to zip.[/]")
+            # Playlist / multiple: bundle into one ZIP.
+            if files:
+                import zipfile
+                zip_name = os.path.basename(out_dir.rstrip(os.sep)) or "downloads"
+                zip_path = os.path.join(os.path.dirname(out_dir) or ".", f"{zip_name}.zip")
+                try:
+                    with console.status(f"[cyan]Packing {len(files)} file(s) into ZIP…[/]", spinner="dots"):
+                        with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_STORED, allowZip64=True) as zf:
+                            for fp in files:
+                                arc = os.path.relpath(fp, os.path.dirname(out_dir) or ".")
+                                zf.write(fp, arcname=arc)
+                    zip_link = BRIDGE.url_for(zip_path)
+                    size_mb = os.path.getsize(zip_path) / (1024 * 1024)
+
+                    deleted = 0
+                    for fp in files:
+                        try:
+                            os.remove(fp); deleted += 1
+                        except OSError:
+                            pass
+                    if os.path.isdir(out_dir):
+                        for root, dirs, _ in os.walk(out_dir, topdown=False):
+                            for d in dirs:
+                                try: os.rmdir(os.path.join(root, d))
+                                except OSError: pass
+                        try: os.rmdir(out_dir)
+                        except OSError: pass
+
+                    console.print(Panel.fit(
+                        f"[bold green]📦 ZIP ready:[/] [white]{os.path.basename(zip_path)}[/] "
+                        f"[dim]({size_mb:.1f} MB, {len(files)} files)[/]\n"
+                        f"[dim]🗑  Deleted {deleted} original file(s) — only the ZIP remains.[/]\n"
+                        f"[bold]⬇ Click to download all at once:[/]\n"
+                        f"  [cyan][link={zip_link}]{zip_link}[/link][/]",
+                        title="🎁 One-click download", border_style="green",
+                    ))
+                except Exception as e:
+                    console.print(f"[yellow]⚠ Could not build ZIP:[/] {e}")
+            else:
+                console.print("[yellow]No files to zip.[/]")
 
         console.print(Panel.fit(
             f"[bold]🌐 Server running:[/] [cyan]{BRIDGE.base_url}[/]\n"
-            "Click the ZIP link above to save all videos to your PC in one go.\n\n"
+            "Click the link(s) above to save to your PC.\n\n"
             "[yellow]Press Enter (or Ctrl+C) to stop the server and exit.[/]",
             title="⏳ Waiting — server open", border_style="cyan",
         ))
@@ -880,6 +1014,7 @@ def main() -> None:
         except (KeyboardInterrupt, EOFError):
             pass
         console.print("[dim]Shutting down server…[/]")
+
 
 
 
