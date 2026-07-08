@@ -32,12 +32,57 @@ import zipfile
 from pathlib import Path
 from urllib.parse import unquote, urlparse
 
+def _auto_install(pkgs: list[str]) -> None:
+    import subprocess
+    print(f"[setup] Installing missing packages: {', '.join(pkgs)} …")
+    cmd = [sys.executable, "-m", "pip", "install", "-U", "--quiet", *pkgs]
+    try:
+        subprocess.check_call(cmd)
+    except subprocess.CalledProcessError:
+        print(f"[setup] pip install failed. Please run manually:\n  {' '.join(cmd)}")
+        sys.exit(1)
+
+
 try:
     from yt_dlp import YoutubeDL
     from yt_dlp.utils import DownloadError
 except ImportError:
-    print("yt-dlp is required. Install with:  pip install -U 'yt-dlp[default]'")
-    sys.exit(1)
+    _auto_install(["yt-dlp[default]"])
+    from yt_dlp import YoutubeDL  # type: ignore
+    from yt_dlp.utils import DownloadError  # type: ignore
+
+# yt-dlp-ejs ships the JS "n-challenge" solver YouTube now requires.
+# Without it you get: "Sign in to confirm you're not a bot" / "Requested format is not available".
+try:
+    import yt_dlp_ejs  # type: ignore  # noqa: F401
+    _HAS_EJS = True
+except ImportError:
+    try:
+        _auto_install(["yt-dlp-ejs"])
+        import yt_dlp_ejs  # type: ignore  # noqa: F401
+        _HAS_EJS = True
+    except Exception:
+        _HAS_EJS = False
+        print("[setup] Warning: yt-dlp-ejs not installed. YouTube may block downloads.")
+        print("        Install manually:  pip install -U yt-dlp-ejs")
+
+# ffmpeg is required for merging video+audio and audio conversion.
+if not shutil.which("ffmpeg"):
+    print("[setup] Warning: ffmpeg not found on PATH.")
+    print("        Video+audio merges and mp3 conversion will fail without it.")
+    print("        Install:  Debian/Ubuntu:  sudo apt-get install -y ffmpeg")
+    print("                  macOS (brew):   brew install ffmpeg")
+    print("                  Windows:        winget install Gyan.FFmpeg")
+
+# Deno is the JS runtime yt-dlp-ejs uses to solve YouTube's n-challenge.
+_HAS_DENO = bool(shutil.which("deno") or shutil.which("node"))
+if not _HAS_DENO:
+    print("[setup] Warning: neither 'deno' nor 'node' found on PATH.")
+    print("        YouTube's bot-check solver needs one of them.")
+    print("        Install deno:  curl -fsSL https://deno.land/install.sh | sh")
+    print("                       (or)  sudo apt-get install -y nodejs")
+
+
 
 ROOT = Path.cwd()
 DOWNLOADS_DIR = ROOT / "downloads"
@@ -116,8 +161,25 @@ class YtdlpJobLogger:
 
 def _friendly_error(error: Exception) -> str:
     msg = str(error)
+    missing = []
+    if not _HAS_EJS: missing.append("pip install -U yt-dlp-ejs")
+    if not _HAS_DENO: missing.append("install deno  (curl -fsSL https://deno.land/install.sh | sh)")
+    fix_hint = ("  Missing on this machine:\n    - " + "\n    - ".join(missing)) if missing else ""
+
+    if "n challenge" in msg or "JavaScript runtime" in msg or "challenge solver" in msg:
+        return ("YouTube's bot-check ('n-challenge') could not be solved. "
+                "You need both the yt-dlp EJS solver plugin AND a JS runtime (deno or node).\n"
+                + (fix_hint or "  Then upgrade yt-dlp:  pip install -U 'yt-dlp[default]' yt-dlp-ejs"))
+    if "Requested format is not available" in msg or "Only images are available" in msg:
+        return ("YouTube returned no playable formats — usually because the bot-check solver is missing. "
+                "Install the EJS solver + a JS runtime, then try again.\n"
+                + (fix_hint or "  pip install -U 'yt-dlp[default]' yt-dlp-ejs   and install deno or node"))
     if "Sign in to confirm" in msg or "not a bot" in msg:
-        return "YouTube is asking for login/bot verification. Upload a fresh cookies.txt exported from the same browser where YouTube is signed in, then fetch again."
+        return ("YouTube is asking for login/bot verification. Two things fix this:\n"
+                "  1) Upload a fresh cookies.txt from a signed-in browser (see step 1).\n"
+                "  2) Install the JS solver so yt-dlp can pass the n-challenge:\n"
+                "     pip install -U 'yt-dlp[default]' yt-dlp-ejs   and install deno or node.\n"
+                + fix_hint)
     if "HTTP Error 429" in msg or "Too Many Requests" in msg:
         return "YouTube is rate-limiting this connection. Wait a few minutes, use fresh cookies, then try again."
     if "HTTP Error 403" in msg:
@@ -256,11 +318,14 @@ def _make_progress_hook(job_id: str):
                 j["speed"] = d.get("speed") or 0
                 j["eta"] = d.get("eta") or 0
                 j["current_pct"] = (done / total * 100) if total else 0
+                j["last_tick"] = time.time()
             elif status == "finished":
-                j["current_pct"] = 100
+                j["current_pct"] = 0
+                j["completed_items"] = int(j.get("completed_items") or 0) + 1
                 j["stage"] = "Merging / converting"
+                j["last_tick"] = time.time()
         if status == "finished":
-            _job_log(job_id, "Download chunk finished. Running merge/conversion if needed…", "ok")
+            _job_log(job_id, "File finished. Running merge/conversion if needed…", "ok")
     return hook
 
 
@@ -342,7 +407,30 @@ def run_download(job_id: str) -> None:
         else:
             ydl_opts["noplaylist"] = True
 
-        if shutil.which("aria2c"):
+        targets = job["urls"]
+        # aria2c gives huge speed boost on many files but does NOT stream per-chunk
+        # progress back to yt-dlp's hooks. Use it only when there are multiple files
+        # so single-video jobs still show a moving progress bar.
+        planned_items = len(targets)
+        if mode == "playlist":
+            pi = (job.get("playlist_items") or "").strip()
+            if pi:
+                count = 0
+                for part in pi.split(","):
+                    part = part.strip()
+                    if not part: continue
+                    if "-" in part:
+                        a, b = part.split("-", 1)
+                        if a.isdigit() and b.isdigit():
+                            count += max(1, int(b) - int(a) + 1)
+                        else:
+                            count += 1
+                    else:
+                        count += 1
+                planned_items = max(1, count)
+            else:
+                planned_items = job.get("total_items") or 1
+        if shutil.which("aria2c") and planned_items > 1:
             ydl_opts["external_downloader"] = "aria2c"
             ydl_opts["external_downloader_args"] = [
                 "-x", "4", "-s", "4", "-k", "1M",
@@ -351,13 +439,15 @@ def run_download(job_id: str) -> None:
                 "--console-log-level=warn", "--summary-interval=0",
                 "--allow-overwrite=true", "--auto-file-renaming=false",
             ]
-            _job_log(job_id, "aria2c detected: using faster external downloader with safe retry settings.")
+            _job_log(job_id, "aria2c detected: using faster external downloader for multi-file job.")
         else:
-            _job_log(job_id, "aria2c not found: using yt-dlp built-in downloader.", "warn")
+            if shutil.which("aria2c"):
+                _job_log(job_id, "Using yt-dlp built-in downloader so live progress can stream.", "ok")
+            else:
+                _job_log(job_id, "aria2c not found: using yt-dlp built-in downloader.", "warn")
 
-        targets = job["urls"]
-        _job_update(job_id, stage="Downloading", total_items=len(targets) if mode != "playlist" else job.get("total_items") or 1)
-        _job_log(job_id, f"Sending {len(targets)} target(s) to yt-dlp…")
+        _job_update(job_id, stage="Downloading", total_items=planned_items)
+        _job_log(job_id, f"Sending {len(targets)} target(s) to yt-dlp… ({planned_items} file(s) expected)")
         with YoutubeDL(ydl_opts) as ydl:
             ydl.download(targets)
 
@@ -430,6 +520,21 @@ class Handler(http.server.SimpleHTTPRequestHandler):
     def log_message(self, *a, **k):
         pass
 
+    # ---- CORS (so a remotely-hosted index.html can call this backend) ----
+    def _cors(self):
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.send_header("Access-Control-Max-Age", "86400")
+
+    def end_headers(self):
+        self._cors()
+        super().end_headers()
+
+    def do_OPTIONS(self):
+        self.send_response(204)
+        self.end_headers()
+
     # ---- utilities ----
     def _send_json(self, code: int, payload: dict) -> None:
         body = json.dumps(payload).encode("utf-8")
@@ -443,6 +548,7 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError):
             # Browser stopped waiting / refreshed. Background jobs keep running.
             return
+
 
     def _read_json(self) -> dict:
         n = int(self.headers.get("Content-Length") or 0)
@@ -570,92 +676,121 @@ class ReuseServer(socketserver.ThreadingTCPServer):
 
 
 INDEX_HTML = r"""<!doctype html>
-<html lang="en">
+<html lang="en" data-theme="light">
 <head>
 <meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width,initial-scale=1"/>
 <title>YouTube Downloader</title>
 <style>
 :root {
-  --bg:#0b0d16; --surface:#12152a; --surface2:#171b35; --line:#242a4a;
-  --text:#eef1fb; --muted:#8b93b8; --soft:#c7d2fe; --accent:#14b8a6;
-  --accent2:#38bdf8; --ok:#22c55e; --warn:#f59e0b; --err:#ef4444;
+  --bg:#fafaf7; --surface:#ffffff; --surface2:#f4f4ef; --line:#e7e5df;
+  --line-2:#eeece6; --text:#1a1a1a; --muted:#6b6b6b; --soft:#2a2a2a;
+  --accent:#111111; --accent-fg:#ffffff; --ring:rgba(17,17,17,.08);
+  --ok:#0f7a3a; --warn:#8a5a00; --err:#b3261e;
+  --ok-bg:#eef7f0; --ok-bd:#d3e8d9;
+  --warn-bg:#faf1de; --warn-bd:#eeddb8;
+  --err-bg:#fbecea; --err-bd:#f2d3ce;
+  --logtime:#9a978d;
+  --shadow-sm:0 1px 2px rgba(17,17,17,.04);
+  --shadow-md:0 4px 20px -6px rgba(17,17,17,.08), 0 1px 2px rgba(17,17,17,.04);
+}
+html[data-theme="dark"] {
+  --bg:#0e0f12; --surface:#16181d; --surface2:#1c1f26; --line:#262a33;
+  --line-2:#2a2f39; --text:#eef0f4; --muted:#9aa1ad; --soft:#c8ccd4;
+  --accent:#f5f5f5; --accent-fg:#0e0f12; --ring:rgba(245,245,245,.12);
+  --ok:#4ade80; --warn:#fbbf24; --err:#f87171;
+  --ok-bg:#0f2418; --ok-bd:#1e3d2b;
+  --warn-bg:#2a1f0a; --warn-bd:#4a3814;
+  --err-bg:#2a1214; --err-bd:#4a1e22;
+  --logtime:#5c6270;
+  --shadow-sm:0 1px 2px rgba(0,0,0,.4);
+  --shadow-md:0 6px 24px -6px rgba(0,0,0,.5), 0 1px 2px rgba(0,0,0,.4);
 }
 * { box-sizing:border-box; }
 html, body { margin:0; padding:0; }
-body { font-family:ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,sans-serif; background:var(--bg); color:var(--text); min-height:100vh; -webkit-font-smoothing:antialiased; }
-.shell { max-width:1120px; margin:0 auto; padding:20px 14px 60px; }
-.hero { display:grid; grid-template-columns:minmax(0,1fr) auto; gap:12px; align-items:center; margin-bottom:16px; }
-.brand { display:flex; gap:10px; align-items:center; min-width:0; }
-.logo { width:38px; height:38px; display:grid; place-items:center; border-radius:9px; background:#e11d48; font-size:20px; flex-shrink:0; }
-h1 { font-size:20px; margin:0; line-height:1.15; letter-spacing:-.01em; }
-.sub { color:var(--muted); margin:2px 0 0; font-size:12px; }
+body { font-family:-apple-system,BlinkMacSystemFont,"Inter",ui-sans-serif,system-ui,"Segoe UI",Roboto,sans-serif; background:var(--bg); color:var(--text); min-height:100vh; -webkit-font-smoothing:antialiased; letter-spacing:-.005em; transition:background .2s ease, color .2s ease; }
+.shell { max-width:1080px; margin:0 auto; padding:28px 20px 60px; }
+.hero { display:grid; grid-template-columns:minmax(0,1fr) auto; gap:14px; align-items:center; margin-bottom:24px; }
+.brand { display:flex; gap:12px; align-items:center; min-width:0; }
+.logo { width:36px; height:36px; display:grid; place-items:center; border-radius:10px; background:var(--accent); color:var(--accent-fg); font-size:16px; flex-shrink:0; box-shadow:var(--shadow-sm); }
+h1 { font-size:20px; margin:0; line-height:1.15; letter-spacing:-.02em; font-weight:600; }
+.sub { color:var(--muted); margin:3px 0 0; font-size:12.5px; }
 .status-strip { display:flex; gap:6px; flex-wrap:wrap; justify-content:flex-end; }
-.grid { display:grid; grid-template-columns:minmax(0,1fr) 340px; gap:14px; align-items:start; }
-.card { background:var(--surface); border:1px solid var(--line); border-radius:12px; padding:16px; margin-bottom:12px; }
-.card h2 { font-size:11px; margin:0 0 12px; color:var(--soft); text-transform:uppercase; letter-spacing:.1em; font-weight:600; }
-.hint { font-size:12.5px; color:var(--muted); margin:0 0 10px; line-height:1.5; }
-label { display:block; font-size:12px; color:var(--muted); margin:6px 0 4px; }
-input[type=text], textarea, select { width:100%; background:#0a0d1e; color:var(--text); border:1px solid #2b3358; border-radius:8px; padding:10px 12px; font-size:14px; font-family:inherit; outline:none; }
-textarea { resize:vertical; min-height:88px; line-height:1.5; }
-input:focus, textarea:focus, select:focus { border-color:var(--accent2); box-shadow:0 0 0 3px rgba(56,189,248,.14); }
-button { background:#0f766e; color:#ecfeff; border:1px solid #2dd4bf; padding:10px 14px; border-radius:8px; font-size:13.5px; font-weight:600; cursor:pointer; min-height:40px; }
-button:hover:not(:disabled) { background:#0d9488; }
-button:disabled { opacity:.5; cursor:not-allowed; }
-button.ghost { background:transparent; border-color:#39426f; color:var(--text); }
-button.secondary { background:#1e40af; border-color:#3b82f6; }
-button.sm { padding:6px 10px; min-height:32px; font-size:12px; }
+.grid { display:grid; grid-template-columns:minmax(0,1fr) 340px; gap:16px; align-items:start; }
+.card { background:var(--surface); border:1px solid var(--line); border-radius:14px; padding:20px; margin-bottom:14px; box-shadow:var(--shadow-sm); transition:box-shadow .2s ease; }
+.card:hover { box-shadow:var(--shadow-md); }
+.card h2 { font-size:10.5px; margin:0 0 14px; color:var(--muted); text-transform:uppercase; letter-spacing:.14em; font-weight:600; }
+.hint { font-size:13px; color:var(--muted); margin:0 0 12px; line-height:1.55; }
+.hint a { color:var(--accent); text-decoration:underline; text-underline-offset:2px; font-weight:500; }
+.hint a:hover { opacity:.7; }
+label { display:block; font-size:12px; color:var(--muted); margin:8px 0 5px; font-weight:500; }
+input[type=text], textarea, select { width:100%; background:var(--surface); color:var(--text); border:1px solid var(--line); border-radius:10px; padding:11px 13px; font-size:13.5px; font-family:inherit; outline:none; transition:border-color .15s, box-shadow .15s; }
+textarea { resize:vertical; min-height:92px; line-height:1.5; }
+input:focus, textarea:focus, select:focus { border-color:var(--accent); box-shadow:0 0 0 3px var(--ring); }
+button { background:var(--accent); color:var(--accent-fg); border:1px solid var(--accent); padding:10px 16px; border-radius:10px; font-size:13px; font-weight:500; cursor:pointer; min-height:38px; letter-spacing:-.005em; transition:transform .05s ease, opacity .15s ease, background .15s ease; }
+button:hover:not(:disabled) { opacity:.88; }
+button:active:not(:disabled) { transform:translateY(1px); }
+button:disabled { opacity:.4; cursor:not-allowed; }
+button.ghost { background:var(--surface); color:var(--text); border-color:var(--line); }
+button.ghost:hover:not(:disabled) { background:var(--surface2); opacity:1; }
+button.secondary { background:var(--accent); }
+button.sm { padding:6px 11px; min-height:30px; font-size:12px; border-radius:8px; }
 .row { display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
-.pill { display:inline-flex; align-items:center; gap:5px; padding:3px 9px; border-radius:999px; background:#1c2145; color:var(--muted); font-size:11.5px; border:1px solid rgba(255,255,255,.05); }
-.pill.ok { background:rgba(34,197,94,.12); color:#86efac; border-color:rgba(34,197,94,.22); }
-.pill.err { background:rgba(239,68,68,.12); color:#fca5a5; border-color:rgba(239,68,68,.22); }
-.pill.warn { background:rgba(245,158,11,.12); color:#fcd34d; border-color:rgba(245,158,11,.22); }
-.videos-toolbar { display:flex; gap:6px; align-items:center; flex-wrap:wrap; margin-bottom:8px; }
+.pill { display:inline-flex; align-items:center; gap:5px; padding:3px 10px; border-radius:999px; background:var(--surface2); color:var(--muted); font-size:11.5px; border:1px solid var(--line); font-weight:500; }
+.pill.ok { background:var(--ok-bg); color:var(--ok); border-color:var(--ok-bd); }
+.pill.err { background:var(--err-bg); color:var(--err); border-color:var(--err-bd); }
+.pill.warn { background:var(--warn-bg); color:var(--warn); border-color:var(--warn-bd); }
+.steps { margin:0 0 4px; padding-left:18px; font-size:12.5px; color:var(--muted); line-height:1.65; }
+.steps li { margin:2px 0; }
+.steps b { color:var(--text); font-weight:600; }
+.videos-toolbar { display:flex; gap:6px; align-items:center; flex-wrap:wrap; margin-bottom:10px; }
 .videos-toolbar .count { color:var(--muted); font-size:12px; margin-left:auto; }
-.videos { display:grid; grid-template-columns:repeat(auto-fill,minmax(240px,1fr)); gap:8px; max-height:360px; overflow:auto; padding:2px; }
-.vid { background:#0a0d1e; border:1px solid #232a52; border-radius:9px; padding:8px; font-size:12px; display:flex; gap:8px; align-items:center; min-width:0; cursor:pointer; transition:border-color .15s; }
-.vid:hover { border-color:#3b82f6; }
-.vid.selected { border-color:#2dd4bf; background:#0d1732; }
-.vid input[type=checkbox] { width:16px; height:16px; accent-color:#14b8a6; flex-shrink:0; cursor:pointer; }
-.thumb, .vid img { width:56px; height:40px; object-fit:cover; border-radius:5px; background:#111827; flex-shrink:0; }
+.videos { display:grid; grid-template-columns:repeat(auto-fill,minmax(240px,1fr)); gap:8px; max-height:380px; overflow:auto; padding:2px; }
+.vid { background:var(--surface); border:1px solid var(--line); border-radius:10px; padding:8px; font-size:12px; display:flex; gap:9px; align-items:center; min-width:0; cursor:pointer; transition:all .15s ease; }
+.vid:hover { border-color:var(--line-2); background:var(--surface2); }
+.vid.selected { border-color:var(--accent); background:var(--surface); box-shadow:0 0 0 2px var(--ring); }
+.vid input[type=checkbox] { width:15px; height:15px; accent-color:var(--accent); flex-shrink:0; cursor:pointer; }
+.thumb, .vid img { width:56px; height:40px; object-fit:cover; border-radius:6px; background:var(--surface2); flex-shrink:0; }
 .vid .t { min-width:0; flex:1; overflow:hidden; }
-.vid .t b { display:block; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-weight:600; color:#eef2ff; font-size:12.5px; }
+.vid .t b { display:block; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-weight:600; color:var(--text); font-size:12.5px; }
 .vid .t span { color:var(--muted); font-size:11px; }
-.progress { background:#0a0d1e; border-radius:999px; overflow:hidden; height:10px; border:1px solid #2b3358; }
-.progress .bar { height:100%; background:linear-gradient(90deg,var(--accent),var(--accent2)); transition:width .25s ease; }
+.progress { background:var(--surface2); border-radius:999px; overflow:hidden; height:8px; border:1px solid var(--line); }
+.progress .bar { height:100%; background:var(--accent); transition:width .3s ease; }
 .hidden { display:none !important; }
-.link-card { background:#0d1b2a; border:1px solid #24597a; border-radius:10px; padding:14px; margin-top:12px; }
-.link-card a { color:#7dd3fc; word-break:break-all; font-weight:600; }
-.err { color:#fca5a5; font-size:12.5px; margin-top:8px; line-height:1.4; }
-.process { position:sticky; top:14px; }
-.process-head { display:flex; align-items:center; justify-content:space-between; gap:10px; margin-bottom:10px; }
-.stage { color:#e0f2fe; font-weight:600; font-size:13.5px; }
-.logbox { height:340px; overflow:auto; background:#060917; border:1px solid #232a52; border-radius:8px; padding:8px; font-family:ui-monospace,SFMono-Regular,Consolas,monospace; font-size:11.5px; line-height:1.5; }
-.logline { display:grid; grid-template-columns:56px 1fr; gap:8px; padding:2px 0; color:#cbd5e1; }
-.logline .time { color:#64748b; }
-.logline.ok .msg { color:#86efac; }
-.logline.warn .msg { color:#fcd34d; }
-.logline.error .msg { color:#fca5a5; }
-.emptylog { color:#64748b; }
-.quick { display:grid; grid-template-columns:repeat(3,1fr); gap:6px; margin-top:10px; }
-.metric { background:#0a0d1e; border:1px solid #232a52; border-radius:8px; padding:8px 10px; }
-.metric b { display:block; font-size:14px; }
-.metric span { color:var(--muted); font-size:10.5px; }
-.footer { text-align:center; color:var(--muted); font-size:11.5px; margin-top:18px; }
+.link-card { background:var(--surface2); border:1px solid var(--line); border-radius:12px; padding:16px; margin-top:12px; }
+.link-card a { color:var(--accent); word-break:break-all; font-weight:600; text-decoration:none; }
+.link-card a:hover { text-decoration:underline; }
+.err { color:var(--err); font-size:12.5px; margin-top:8px; line-height:1.5; }
+.process { position:sticky; top:20px; }
+.process-head { display:flex; align-items:center; justify-content:space-between; gap:10px; margin-bottom:12px; }
+.stage { color:var(--text); font-weight:600; font-size:13.5px; }
+.logbox { height:340px; overflow:auto; background:var(--surface2); border:1px solid var(--line); border-radius:10px; padding:10px; font-family:"SF Mono",ui-monospace,SFMono-Regular,Consolas,monospace; font-size:11.5px; line-height:1.6; }
+.logline { display:grid; grid-template-columns:56px 1fr; gap:8px; padding:2px 0; color:var(--soft); }
+.logline .time { color:var(--logtime); }
+.logline.ok .msg { color:var(--ok); }
+.logline.warn .msg { color:var(--warn); }
+.logline.error .msg { color:var(--err); }
+.emptylog { color:var(--logtime); }
+.quick { display:grid; grid-template-columns:repeat(3,1fr); gap:8px; margin-top:10px; }
+.metric { background:var(--surface2); border:1px solid var(--line); border-radius:10px; padding:10px 12px; }
+.metric b { display:block; font-size:14px; font-weight:600; color:var(--text); }
+.metric span { color:var(--muted); font-size:10.5px; text-transform:uppercase; letter-spacing:.08em; margin-top:2px; display:block; }
+.footer { text-align:center; color:var(--muted); font-size:11.5px; margin-top:24px; }
 .file-input { color:var(--muted); font-size:12px; max-width:260px; }
+code { background:var(--surface2); border:1px solid var(--line); padding:1px 6px; border-radius:5px; font-size:12px; font-family:"SF Mono",ui-monospace,monospace; }
 @media (max-width:860px) {
   .grid { grid-template-columns:1fr; }
   .process { position:static; }
   .videos { max-height:300px; }
   .logbox { height:220px; }
-  .quick { grid-template-columns:repeat(3,1fr); }
   h1 { font-size:18px; }
+  .shell { padding:20px 16px 50px; }
 }
 @media (max-width:480px) {
-  .shell { padding:14px 10px 40px; }
-  .card { padding:14px; }
+  .shell { padding:16px 12px 40px; }
+  .card { padding:16px; border-radius:12px; }
   .videos { grid-template-columns:1fr; }
-  .hero { grid-template-columns:1fr; }
+  .hero { grid-template-columns:1fr; margin-bottom:16px; }
   .status-strip { justify-content:flex-start; }
 }
 </style>
@@ -673,15 +808,22 @@ button.sm { padding:6px 10px; min-height:32px; font-size:12px; }
     <div class="status-strip">
       <span class="pill ok">Local web app</span>
       <span class="pill" id="activeJobPill">Idle</span>
+      <button id="btnTheme" class="ghost sm" type="button" title="Toggle light/dark" aria-label="Toggle theme">🌙</button>
     </div>
   </header>
 
   <main class="grid">
     <section>
       <div class="card">
-        <h2>1 · Cookies</h2>
-        <p class="hint">Upload a fresh Netscape cookies.txt when YouTube asks for sign-in, bot verification, private videos, or age checks.</p>
-        <div class="row">
+        <h2>1 · Cookies (optional but recommended)</h2>
+        <p class="hint">YouTube often asks to confirm you're not a bot, or blocks private/age-restricted videos. A fresh <code>cookies.txt</code> from your signed-in browser fixes almost every "sign in / bot" error.</p>
+        <ol class="steps">
+          <li>Install the free extension: <a href="https://chromewebstore.google.com/detail/get-cookiestxt-locally/cclelndahbckbenkjhflpdbgdldlbecc" target="_blank" rel="noopener"><b>Get cookies.txt LOCALLY</b></a> (works on Chrome, Edge, Brave).</li>
+          <li>Open <a href="https://www.youtube.com" target="_blank" rel="noopener">youtube.com</a> in the <b>same browser</b> and make sure you're signed in.</li>
+          <li>Click the extension icon → <b>Export</b> (or <b>Download</b>) → save <code>youtube.com_cookies.txt</code>.</li>
+          <li>Upload that file below. Re-export if YouTube starts asking again (cookies expire).</li>
+        </ol>
+        <div class="row" style="margin-top:12px">
           <input class="file-input" type="file" id="cookieFile" accept=".txt"/>
           <button id="btnUpload" class="ghost">Upload cookies</button>
           <span id="cookieStatus" class="pill warn">No cookies</span>
@@ -755,6 +897,28 @@ button.sm { padding:6px 10px; min-height:32px; font-size:12px; }
 <script>
 const $ = s => document.querySelector(s);
 let state = { cookies_file: "", probe: null, activeJob: "" };
+
+// ---- theme toggle (persists in localStorage) ----
+(function initTheme() {
+  try {
+    const saved = localStorage.getItem("ytdl_theme");
+    const prefersDark = window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches;
+    const theme = saved || (prefersDark ? "dark" : "light");
+    document.documentElement.setAttribute("data-theme", theme);
+  } catch(_){}
+})();
+function applyTheme(t) {
+  document.documentElement.setAttribute("data-theme", t);
+  try { localStorage.setItem("ytdl_theme", t); } catch(_){}
+  const btn = document.getElementById("btnTheme");
+  if (btn) btn.textContent = t === "dark" ? "☀" : "🌙";
+}
+document.addEventListener("DOMContentLoaded", () => {
+  const cur = document.documentElement.getAttribute("data-theme") || "light";
+  applyTheme(cur);
+  const btn = document.getElementById("btnTheme");
+  if (btn) btn.onclick = () => applyTheme(document.documentElement.getAttribute("data-theme") === "dark" ? "light" : "dark");
+});
 
 async function api(path, opts={}) {
   const r = await fetch(path, opts);
@@ -975,9 +1139,10 @@ async function pollJob(id) {
     const overall = j.status === "done" ? 100 : Math.min(99, ((done + (j.current_pct||0)/100) / totalItems) * 100);
     $("#progBar").style.width = overall.toFixed(1) + "%";
     renderProcess(j, overall);
+    const filesTxt = totalItems > 1 ? ` · file ${Math.min(done+1, totalItems)}/${totalItems}` : "";
     $("#progText").textContent =
       j.status === "running"
-        ? `${j.stage || "Downloading"} · ${overall.toFixed(1)}% · ${fmtSpeed(j.speed)} · ETA ${fmtEta(j.eta)}`
+        ? `${j.stage || "Downloading"} · ${overall.toFixed(1)}%${filesTxt} · ${fmtSpeed(j.speed)} · ETA ${fmtEta(j.eta)}`
         : j.status === "queued" ? "Queued…"
         : j.status === "done"   ? "Complete"
         : j.status === "error"  ? (j.error||"Download failed") : j.status;
