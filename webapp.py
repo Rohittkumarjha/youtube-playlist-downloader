@@ -95,6 +95,31 @@ JOBS_LOCK = threading.Lock()
 MAX_LOG_LINES = 250
 
 
+def _list_downloaded_files() -> list[dict]:
+    """List every file inside DOWNLOADS_DIR (recursive) with metadata for the UI library."""
+    out: list[dict] = []
+    if not DOWNLOADS_DIR.exists():
+        return out
+    for fp in sorted(DOWNLOADS_DIR.rglob("*"), key=lambda p: p.stat().st_mtime if p.exists() else 0, reverse=True):
+        if not fp.is_file():
+            continue
+        try:
+            st = fp.stat()
+            rel = fp.relative_to(DOWNLOADS_DIR).as_posix()
+            out.append({
+                "name": fp.name,
+                "path": rel,
+                "url": "/downloads/" + rel,
+                "size_mb": round(st.st_size / (1024 * 1024), 2),
+                "mtime": int(st.st_mtime),
+                "is_zip": fp.suffix.lower() == ".zip",
+                "kind": "audio" if fp.suffix.lower() in {".mp3", ".m4a", ".opus", ".wav"} else ("zip" if fp.suffix.lower()==".zip" else "video"),
+            })
+        except OSError:
+            continue
+    return out
+
+
 # ---------------- helpers ----------------
 def _split_urls(text: str) -> list[str]:
     parts = re.split(r"[\s,]+", text.strip())
@@ -523,7 +548,7 @@ class Handler(http.server.SimpleHTTPRequestHandler):
     # ---- CORS (so a remotely-hosted index.html can call this backend) ----
     def _cors(self):
         self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "Content-Type")
         self.send_header("Access-Control-Max-Age", "86400")
 
@@ -578,9 +603,42 @@ class Handler(http.server.SimpleHTTPRequestHandler):
                 return self._send_json(404, {"error": "unknown job"})
             out.pop("cookies_file", None)
             return self._send_json(200, out)
+        if path == "/api/files":
+            return self._send_json(200, {"files": _list_downloaded_files()})
         if path.startswith("/downloads/"):
             return super().do_GET()
         self.send_error(404)
+
+    def do_DELETE(self):
+        path = urlparse(self.path).path
+        try:
+            if path == "/api/files":
+                data = self._read_json()
+                rel = (data.get("path") or "").strip().lstrip("/")
+                if not rel:
+                    return self._send_json(400, {"error": "Missing path"})
+                target = (DOWNLOADS_DIR / rel).resolve()
+                try:
+                    target.relative_to(DOWNLOADS_DIR.resolve())
+                except ValueError:
+                    return self._send_json(400, {"error": "Invalid path"})
+                if not target.exists():
+                    return self._send_json(404, {"error": "Not found"})
+                if target.is_dir():
+                    shutil.rmtree(target)
+                else:
+                    target.unlink()
+                    # clean up now-empty parent folder
+                    try:
+                        if target.parent != DOWNLOADS_DIR and not any(target.parent.iterdir()):
+                            target.parent.rmdir()
+                    except Exception:
+                        pass
+                return self._send_json(200, {"ok": True, "files": _list_downloaded_files()})
+            self.send_error(404)
+        except Exception as e:
+            traceback.print_exc()
+            self._send_json(500, {"error": str(e)})
 
     def do_POST(self):
         path = urlparse(self.path).path
@@ -676,504 +734,849 @@ class ReuseServer(socketserver.ThreadingTCPServer):
 
 
 INDEX_HTML = r"""<!doctype html>
-<html lang="en" data-theme="light">
+<html lang="en" data-theme="dark">
 <head>
 <meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width,initial-scale=1"/>
-<title>YouTube Downloader</title>
+<title>ytdl — hacker terminal</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
 <style>
 :root {
-  --bg:#fafaf7; --surface:#ffffff; --surface2:#f4f4ef; --line:#e7e5df;
-  --line-2:#eeece6; --text:#1a1a1a; --muted:#6b6b6b; --soft:#2a2a2a;
-  --accent:#111111; --accent-fg:#ffffff; --ring:rgba(17,17,17,.08);
-  --ok:#0f7a3a; --warn:#8a5a00; --err:#b3261e;
-  --ok-bg:#eef7f0; --ok-bd:#d3e8d9;
-  --warn-bg:#faf1de; --warn-bd:#eeddb8;
-  --err-bg:#fbecea; --err-bd:#f2d3ce;
-  --logtime:#9a978d;
-  --shadow-sm:0 1px 2px rgba(17,17,17,.04);
-  --shadow-md:0 4px 20px -6px rgba(17,17,17,.08), 0 1px 2px rgba(17,17,17,.04);
+  --bg:#05080a; --bg2:#0a1014; --panel:#0e1519cc; --panel2:#111a20cc;
+  --line:#1e2a33; --line2:#2a3a45;
+  --green:#39ff14; --green2:#0aff7a; --dim:#5fb37a; --muted:#8aa89a;
+  --text:#e6f1ea; --soft:#c7e6d3;
+  --amber:#ffb454; --red:#ff5670; --cyan:#5efcff; --violet:#a48bff;
+  --glow:0 0 12px rgba(57,255,20,.35);
+  --mono:"JetBrains Mono", ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  --sans:"Inter", ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --radius:14px;
 }
-html[data-theme="dark"] {
-  --bg:#0e0f12; --surface:#16181d; --surface2:#1c1f26; --line:#262a33;
-  --line-2:#2a2f39; --text:#eef0f4; --muted:#9aa1ad; --soft:#c8ccd4;
-  --accent:#f5f5f5; --accent-fg:#0e0f12; --ring:rgba(245,245,245,.12);
-  --ok:#4ade80; --warn:#fbbf24; --err:#f87171;
-  --ok-bg:#0f2418; --ok-bd:#1e3d2b;
-  --warn-bg:#2a1f0a; --warn-bd:#4a3814;
-  --err-bg:#2a1214; --err-bd:#4a1e22;
-  --logtime:#5c6270;
-  --shadow-sm:0 1px 2px rgba(0,0,0,.4);
-  --shadow-md:0 6px 24px -6px rgba(0,0,0,.5), 0 1px 2px rgba(0,0,0,.4);
+html[data-theme="light"] {
+  --bg:#f4f7f6; --bg2:#e8efeb; --panel:#ffffffcc; --panel2:#f6faf7cc;
+  --line:#d3ded6; --line2:#b3c4b8;
+  --green:#0a8a3a; --green2:#0aa055; --dim:#3d6a4d; --muted:#556b5c;
+  --text:#0b1a12; --soft:#183a24; --amber:#8a5a00; --red:#b3261e;
+  --glow:0 0 0 rgba(0,0,0,0);
 }
 * { box-sizing:border-box; }
 html, body { margin:0; padding:0; }
-body { font-family:-apple-system,BlinkMacSystemFont,"Inter",ui-sans-serif,system-ui,"Segoe UI",Roboto,sans-serif; background:var(--bg); color:var(--text); min-height:100vh; -webkit-font-smoothing:antialiased; letter-spacing:-.005em; transition:background .2s ease, color .2s ease; }
-.shell { max-width:1080px; margin:0 auto; padding:28px 20px 60px; }
-.hero { display:grid; grid-template-columns:minmax(0,1fr) auto; gap:14px; align-items:center; margin-bottom:24px; }
-.brand { display:flex; gap:12px; align-items:center; min-width:0; }
-.logo { width:36px; height:36px; display:grid; place-items:center; border-radius:10px; background:var(--accent); color:var(--accent-fg); font-size:16px; flex-shrink:0; box-shadow:var(--shadow-sm); }
-h1 { font-size:20px; margin:0; line-height:1.15; letter-spacing:-.02em; font-weight:600; }
-.sub { color:var(--muted); margin:3px 0 0; font-size:12.5px; }
-.status-strip { display:flex; gap:6px; flex-wrap:wrap; justify-content:flex-end; }
-.grid { display:grid; grid-template-columns:minmax(0,1fr) 340px; gap:16px; align-items:start; }
-.card { background:var(--surface); border:1px solid var(--line); border-radius:14px; padding:20px; margin-bottom:14px; box-shadow:var(--shadow-sm); transition:box-shadow .2s ease; }
-.card:hover { box-shadow:var(--shadow-md); }
-.card h2 { font-size:10.5px; margin:0 0 14px; color:var(--muted); text-transform:uppercase; letter-spacing:.14em; font-weight:600; }
-.hint { font-size:13px; color:var(--muted); margin:0 0 12px; line-height:1.55; }
-.hint a { color:var(--accent); text-decoration:underline; text-underline-offset:2px; font-weight:500; }
-.hint a:hover { opacity:.7; }
-label { display:block; font-size:12px; color:var(--muted); margin:8px 0 5px; font-weight:500; }
-input[type=text], textarea, select { width:100%; background:var(--surface); color:var(--text); border:1px solid var(--line); border-radius:10px; padding:11px 13px; font-size:13.5px; font-family:inherit; outline:none; transition:border-color .15s, box-shadow .15s; }
-textarea { resize:vertical; min-height:92px; line-height:1.5; }
-input:focus, textarea:focus, select:focus { border-color:var(--accent); box-shadow:0 0 0 3px var(--ring); }
-button { background:var(--accent); color:var(--accent-fg); border:1px solid var(--accent); padding:10px 16px; border-radius:10px; font-size:13px; font-weight:500; cursor:pointer; min-height:38px; letter-spacing:-.005em; transition:transform .05s ease, opacity .15s ease, background .15s ease; }
-button:hover:not(:disabled) { opacity:.88; }
-button:active:not(:disabled) { transform:translateY(1px); }
-button:disabled { opacity:.4; cursor:not-allowed; }
-button.ghost { background:var(--surface); color:var(--text); border-color:var(--line); }
-button.ghost:hover:not(:disabled) { background:var(--surface2); opacity:1; }
-button.secondary { background:var(--accent); }
-button.sm { padding:6px 11px; min-height:30px; font-size:12px; border-radius:8px; }
-.row { display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
-.pill { display:inline-flex; align-items:center; gap:5px; padding:3px 10px; border-radius:999px; background:var(--surface2); color:var(--muted); font-size:11.5px; border:1px solid var(--line); font-weight:500; }
-.pill.ok { background:var(--ok-bg); color:var(--ok); border-color:var(--ok-bd); }
-.pill.err { background:var(--err-bg); color:var(--err); border-color:var(--err-bd); }
-.pill.warn { background:var(--warn-bg); color:var(--warn); border-color:var(--warn-bd); }
-.steps { margin:0 0 4px; padding-left:18px; font-size:12.5px; color:var(--muted); line-height:1.65; }
-.steps li { margin:2px 0; }
-.steps b { color:var(--text); font-weight:600; }
-.videos-toolbar { display:flex; gap:6px; align-items:center; flex-wrap:wrap; margin-bottom:10px; }
-.videos-toolbar .count { color:var(--muted); font-size:12px; margin-left:auto; }
-.videos { display:grid; grid-template-columns:repeat(auto-fill,minmax(240px,1fr)); gap:8px; max-height:380px; overflow:auto; padding:2px; }
-.vid { background:var(--surface); border:1px solid var(--line); border-radius:10px; padding:8px; font-size:12px; display:flex; gap:9px; align-items:center; min-width:0; cursor:pointer; transition:all .15s ease; }
-.vid:hover { border-color:var(--line-2); background:var(--surface2); }
-.vid.selected { border-color:var(--accent); background:var(--surface); box-shadow:0 0 0 2px var(--ring); }
-.vid input[type=checkbox] { width:15px; height:15px; accent-color:var(--accent); flex-shrink:0; cursor:pointer; }
-.thumb, .vid img { width:56px; height:40px; object-fit:cover; border-radius:6px; background:var(--surface2); flex-shrink:0; }
+body {
+  font-family:var(--sans);
+  background:var(--bg); color:var(--text);
+  min-height:100vh;
+  -webkit-font-smoothing:antialiased; text-rendering:optimizeLegibility;
+  position:relative; overflow-x:hidden;
+}
+
+/* ---------- HACKER MATRIX BACKGROUND (canvas) ---------- */
+#matrix {
+  position:fixed; inset:0; z-index:0; pointer-events:none;
+  opacity:.28; filter:blur(.3px);
+}
+html[data-theme="light"] #matrix { opacity:.10; }
+/* soft ambient glows in front of matrix but behind content */
+body::before {
+  content:""; position:fixed; inset:0; pointer-events:none; z-index:1;
+  background:
+    radial-gradient(900px 500px at 12% -10%, rgba(57,255,20,.10), transparent 55%),
+    radial-gradient(700px 450px at 110% 8%, rgba(94,252,255,.06), transparent 60%),
+    linear-gradient(180deg, transparent, rgba(0,0,0,.35));
+}
+
+.shell { max-width:1180px; margin:0 auto; padding:26px 20px 60px; position:relative; z-index:5; }
+
+/* ---------- header ---------- */
+.banner {
+  border:1px solid var(--line2);
+  background:linear-gradient(180deg, var(--panel), var(--panel2));
+  backdrop-filter:blur(10px) saturate(1.1); -webkit-backdrop-filter:blur(10px) saturate(1.1);
+  border-radius:var(--radius); padding:18px 20px; margin-bottom:20px;
+  box-shadow:0 10px 40px -20px rgba(0,0,0,.6), inset 0 1px 0 rgba(255,255,255,.04);
+}
+.banner-top { display:flex; gap:14px; align-items:center; justify-content:space-between; flex-wrap:wrap; }
+.brand { display:flex; align-items:center; gap:12px; }
+.logo {
+  width:38px; height:38px; border-radius:10px;
+  background:linear-gradient(135deg, var(--green), var(--cyan));
+  display:grid; place-items:center; color:#001208; font-family:var(--mono); font-weight:700;
+  box-shadow:0 0 20px rgba(57,255,20,.35), inset 0 0 12px rgba(255,255,255,.25);
+}
+.brand h1 { margin:0; font-size:18px; letter-spacing:.02em; font-weight:700; }
+.brand h1 span { color:var(--green); }
+.brand p  { margin:2px 0 0; font-size:12px; color:var(--muted); font-family:var(--mono); }
+.status-strip { display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
+
+/* ---------- pills ---------- */
+.pill {
+  display:inline-flex; align-items:center; gap:6px;
+  padding:4px 10px; border-radius:999px;
+  color:var(--muted); font-size:11px; font-weight:600;
+  border:1px solid var(--line2); background:rgba(255,255,255,.02);
+  font-family:var(--mono); text-transform:uppercase; letter-spacing:.06em;
+}
+.pill.ok   { color:var(--green); border-color:rgba(57,255,20,.45); background:rgba(57,255,20,.08); }
+.pill.warn { color:var(--amber); border-color:rgba(255,180,84,.5); background:rgba(255,180,84,.08); }
+.pill.err  { color:var(--red);   border-color:rgba(255,86,112,.5); background:rgba(255,86,112,.08); }
+.pill::before { content:"●"; font-size:8px; }
+
+/* ---------- layout ---------- */
+.grid { display:grid; grid-template-columns:minmax(0,1fr) 380px; gap:18px; align-items:start; }
+.card {
+  background:linear-gradient(180deg, var(--panel), var(--panel2));
+  backdrop-filter:blur(14px) saturate(1.1); -webkit-backdrop-filter:blur(14px) saturate(1.1);
+  border:1px solid var(--line2);
+  border-radius:var(--radius); padding:18px 20px 20px; margin-bottom:16px;
+  box-shadow:0 12px 40px -24px rgba(0,0,0,.7), inset 0 1px 0 rgba(255,255,255,.04);
+  transition:transform .2s ease, box-shadow .25s ease;
+}
+.card:hover { box-shadow:0 16px 50px -22px rgba(0,0,0,.75), inset 0 1px 0 rgba(255,255,255,.06); }
+.card h2 {
+  font-family:var(--mono);
+  font-size:12px; margin:0 0 14px; color:var(--green);
+  letter-spacing:.06em; font-weight:700; text-transform:uppercase;
+  padding-bottom:10px; border-bottom:1px dashed var(--line2);
+}
+.card h2::before { content:"$ "; color:var(--dim); }
+.hint { font-size:13px; color:var(--muted); margin:0 0 12px; line-height:1.6; }
+.hint a { color:var(--cyan); text-decoration:none; border-bottom:1px dashed rgba(94,252,255,.4); }
+.hint a:hover { color:var(--green); border-color:var(--green); }
+label { display:block; font-family:var(--mono); font-size:11px; color:var(--dim); margin:10px 0 6px; text-transform:uppercase; letter-spacing:.08em; }
+
+input[type=text], textarea, select {
+  width:100%; background:rgba(0,0,0,.35); color:var(--soft);
+  border:1px solid var(--line2); border-radius:10px;
+  padding:11px 13px; font-size:13.5px; font-family:var(--mono); outline:none;
+  transition:border-color .15s, box-shadow .15s, background .15s;
+  caret-color:var(--green);
+}
+textarea { resize:vertical; min-height:92px; line-height:1.55; }
+input:focus, textarea:focus, select:focus {
+  border-color:var(--green); background:rgba(0,0,0,.5);
+  box-shadow:0 0 0 3px rgba(57,255,20,.14);
+}
+html[data-theme="light"] input, html[data-theme="light"] textarea, html[data-theme="light"] select { background:#fff; color:var(--text); }
+
+button {
+  background:transparent; color:var(--green); border:1px solid rgba(57,255,20,.55);
+  padding:10px 16px; border-radius:10px; font-size:12.5px; font-weight:600;
+  cursor:pointer; min-height:38px; letter-spacing:.04em;
+  font-family:var(--mono); transition:all .18s ease; position:relative;
+}
+button:hover:not(:disabled) { background:rgba(57,255,20,.12); box-shadow:var(--glow); transform:translateY(-1px); }
+button:active:not(:disabled) { transform:translateY(0); }
+button:disabled { opacity:.35; cursor:not-allowed; }
+button.ghost { color:var(--muted); border-color:var(--line2); }
+button.ghost:hover:not(:disabled) { color:var(--green); border-color:var(--green); }
+button.primary {
+  background:linear-gradient(135deg, rgba(57,255,20,.22), rgba(94,252,255,.14));
+  color:#eaffe6; border-color:rgba(57,255,20,.6);
+  box-shadow:0 6px 20px -8px rgba(57,255,20,.5);
+}
+button.primary:hover:not(:disabled) { box-shadow:0 10px 30px -8px rgba(57,255,20,.55), var(--glow); }
+button.sm { padding:6px 11px; min-height:30px; font-size:11.5px; }
+
+.row { display:flex; gap:10px; flex-wrap:wrap; align-items:center; }
+
+/* ---------- cookie drag & drop ---------- */
+.drop {
+  border:1.5px dashed var(--line2); border-radius:12px;
+  padding:20px; text-align:center; cursor:pointer;
+  background:rgba(0,0,0,.2); transition:all .2s ease;
+  font-family:var(--mono); color:var(--muted); font-size:13px;
+}
+.drop:hover { border-color:var(--green); color:var(--soft); background:rgba(57,255,20,.05); }
+.drop.dragover { border-color:var(--green); background:rgba(57,255,20,.12); color:var(--green); transform:scale(1.01); box-shadow:var(--glow); }
+.drop .drop-icon { font-size:26px; color:var(--green); margin-bottom:8px; }
+.drop .drop-hint { display:block; font-size:11px; color:var(--dim); margin-top:6px; }
+.drop input[type=file] { display:none; }
+.steps { margin:10px 0 0; padding-left:0; list-style:none; font-size:12.5px; color:var(--muted); line-height:1.8; font-family:var(--mono); }
+.steps li::before { content:"› "; color:var(--green); }
+.steps b { color:var(--soft); }
+
+/* ---------- videos ---------- */
+.videos-toolbar { display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-bottom:12px; }
+.videos-toolbar .count { color:var(--dim); font-size:11.5px; margin-left:auto; font-family:var(--mono); }
+.videos { display:grid; grid-template-columns:repeat(auto-fill,minmax(240px,1fr)); gap:10px; max-height:380px; overflow:auto; padding:4px; }
+.vid {
+  background:rgba(0,0,0,.28); border:1px solid var(--line);
+  border-radius:10px; padding:9px; font-size:12px;
+  display:flex; gap:10px; align-items:center; min-width:0; cursor:pointer;
+  transition:all .18s ease;
+}
+.vid:hover { border-color:var(--dim); transform:translateY(-1px); }
+.vid.selected { border-color:rgba(57,255,20,.6); box-shadow:0 0 0 1px rgba(57,255,20,.25); background:rgba(57,255,20,.05); }
+.vid input[type=checkbox] { width:16px; height:16px; accent-color:var(--green); flex-shrink:0; }
+.thumb, .vid img { width:60px; height:44px; object-fit:cover; border-radius:6px; background:#001a0d; flex-shrink:0; }
 .vid .t { min-width:0; flex:1; overflow:hidden; }
-.vid .t b { display:block; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-weight:600; color:var(--text); font-size:12.5px; }
-.vid .t span { color:var(--muted); font-size:11px; }
-.progress { background:var(--surface2); border-radius:999px; overflow:hidden; height:8px; border:1px solid var(--line); }
-.progress .bar { height:100%; background:var(--accent); transition:width .3s ease; }
+.vid .t b { display:block; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-weight:600; color:var(--soft); font-size:12.5px; }
+.vid .t span { color:var(--dim); font-size:11px; font-family:var(--mono); }
+
+/* ---------- progress / stdout ---------- */
+.progress { background:rgba(0,0,0,.4); border-radius:999px; overflow:hidden; height:12px; border:1px solid var(--line2); position:relative; }
+.progress .bar {
+  height:100%; background:linear-gradient(90deg, var(--green2), var(--green), var(--cyan));
+  transition:width .3s ease; box-shadow:var(--glow);
+  background-size:200% 100%; animation:barshift 2s linear infinite;
+}
+@keyframes barshift { from { background-position:0 0; } to { background-position:200% 0; } }
 .hidden { display:none !important; }
-.link-card { background:var(--surface2); border:1px solid var(--line); border-radius:12px; padding:16px; margin-top:12px; }
-.link-card a { color:var(--accent); word-break:break-all; font-weight:600; text-decoration:none; }
-.link-card a:hover { text-decoration:underline; }
-.err { color:var(--err); font-size:12.5px; margin-top:8px; line-height:1.5; }
+
+.link-card { background:rgba(0,0,0,.28); border:1px dashed rgba(57,255,20,.6); border-radius:12px; padding:14px; margin-top:12px; }
+.link-card a { color:var(--cyan); word-break:break-all; font-weight:600; text-decoration:none; }
+.link-card a:hover { color:var(--green); }
+.err { color:var(--red); font-size:12.5px; margin-top:8px; line-height:1.5; font-family:var(--mono); }
+
 .process { position:sticky; top:20px; }
 .process-head { display:flex; align-items:center; justify-content:space-between; gap:10px; margin-bottom:12px; }
-.stage { color:var(--text); font-weight:600; font-size:13.5px; }
-.logbox { height:340px; overflow:auto; background:var(--surface2); border:1px solid var(--line); border-radius:10px; padding:10px; font-family:"SF Mono",ui-monospace,SFMono-Regular,Consolas,monospace; font-size:11.5px; line-height:1.6; }
-.logline { display:grid; grid-template-columns:56px 1fr; gap:8px; padding:2px 0; color:var(--soft); }
-.logline .time { color:var(--logtime); }
-.logline.ok .msg { color:var(--ok); }
-.logline.warn .msg { color:var(--warn); }
-.logline.error .msg { color:var(--err); }
-.emptylog { color:var(--logtime); }
-.quick { display:grid; grid-template-columns:repeat(3,1fr); gap:8px; margin-top:10px; }
-.metric { background:var(--surface2); border:1px solid var(--line); border-radius:10px; padding:10px 12px; }
-.metric b { display:block; font-size:14px; font-weight:600; color:var(--text); }
-.metric span { color:var(--muted); font-size:10.5px; text-transform:uppercase; letter-spacing:.08em; margin-top:2px; display:block; }
-.footer { text-align:center; color:var(--muted); font-size:11.5px; margin-top:24px; }
-.file-input { color:var(--muted); font-size:12px; max-width:260px; }
-code { background:var(--surface2); border:1px solid var(--line); padding:1px 6px; border-radius:5px; font-size:12px; font-family:"SF Mono",ui-monospace,monospace; }
+.stage { color:var(--soft); font-weight:600; font-size:13px; font-family:var(--mono); }
+.logbox {
+  height:340px; overflow:auto; background:rgba(0,0,0,.55);
+  border:1px solid var(--line2); border-radius:10px; padding:12px;
+  font-family:var(--mono); font-size:11.5px; line-height:1.65;
+}
+.logline { display:grid; grid-template-columns:60px 1fr; gap:8px; padding:1px 0; color:var(--soft); }
+.logline .time { color:var(--dim); }
+.logline .msg::before { content:"$ "; color:var(--dim); }
+.logline.ok    .msg { color:var(--green); }
+.logline.warn  .msg { color:var(--amber); }
+.logline.error .msg { color:var(--red); }
+.emptylog { color:var(--dim); font-style:italic; }
+.emptylog::before { content:"// "; }
+
+.quick { display:grid; grid-template-columns:repeat(3,1fr); gap:10px; }
+.metric { background:rgba(0,0,0,.3); border:1px solid var(--line2); border-radius:10px; padding:10px 12px; }
+.metric b { display:block; font-size:18px; font-weight:700; color:var(--green); font-family:var(--mono); }
+.metric span { color:var(--dim); font-size:10px; text-transform:uppercase; letter-spacing:.1em; margin-top:2px; display:block; }
+
+.footer { text-align:center; color:var(--dim); font-size:11.5px; margin-top:26px; font-family:var(--mono); }
+
+.lib-grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(240px,1fr)); gap:12px; }
+.lib-item { background:rgba(0,0,0,.3); border:1px solid var(--line2); border-radius:10px; padding:12px; display:flex; flex-direction:column; gap:8px; transition:all .18s ease; }
+.lib-item:hover { border-color:rgba(57,255,20,.5); transform:translateY(-2px); }
+.lib-item .lib-name { font-weight:600; font-size:12.5px; word-break:break-all; color:var(--soft); font-family:var(--mono); }
+.lib-item .lib-actions { display:flex; gap:6px; margin-top:2px; }
+.lib-item a.lib-dl { flex:1; text-align:center; text-decoration:none; padding:7px 10px; border-radius:8px; border:1px solid rgba(57,255,20,.55); color:var(--green); font-size:11.5px; font-weight:600; font-family:var(--mono); text-transform:uppercase; letter-spacing:.05em; }
+.lib-item a.lib-dl:hover { background:rgba(57,255,20,.12); }
+.lib-item button.lib-del { color:var(--red); border-color:rgba(255,86,112,.5); }
+.lib-item button.lib-del:hover:not(:disabled) { background:rgba(255,86,112,.12); }
+
+code { background:rgba(0,0,0,.35); border:1px solid var(--line2); padding:1px 6px; border-radius:5px; font-size:11.5px; font-family:var(--mono); color:var(--cyan); }
+
+/* ---------- PROCESSING OVERLAY ---------- */
+body.busy .shell > *:not(.overlay) { filter:blur(6px) saturate(.85); pointer-events:none; user-select:none; transition:filter .3s ease; }
+.overlay {
+  position:fixed; inset:0; z-index:50; display:none;
+  align-items:center; justify-content:center; padding:20px;
+  background:radial-gradient(ellipse at center, rgba(0,10,4,.55), rgba(0,0,0,.85));
+  backdrop-filter:blur(6px); -webkit-backdrop-filter:blur(6px);
+  animation:fadein .3s ease;
+}
+body.busy .overlay { display:flex; }
+@keyframes fadein { from { opacity:0; } to { opacity:1; } }
+.overlay .box {
+  width:min(720px, 100%);
+  background:linear-gradient(180deg, rgba(14,21,25,.95), rgba(10,15,18,.98));
+  border:1px solid rgba(57,255,20,.4);
+  border-radius:16px; padding:22px 24px;
+  box-shadow:0 30px 100px -20px rgba(0,0,0,.9), 0 0 60px -10px rgba(57,255,20,.35);
+  animation:popin .35s cubic-bezier(.2,.9,.3,1.2);
+}
+@keyframes popin { from { transform:translateY(16px) scale(.96); opacity:0; } to { transform:none; opacity:1; } }
+.overlay .ov-head { display:flex; align-items:center; gap:12px; margin-bottom:14px; }
+.overlay .spinner {
+  width:34px; height:34px; border-radius:50%;
+  border:3px solid rgba(57,255,20,.18);
+  border-top-color:var(--green);
+  animation:spin 1s linear infinite;
+  box-shadow:0 0 18px rgba(57,255,20,.35);
+}
+@keyframes spin { to { transform:rotate(360deg); } }
+.overlay h3 { margin:0; font-size:16px; font-family:var(--mono); color:var(--green); letter-spacing:.05em; }
+.overlay h3 span { color:var(--muted); font-weight:400; margin-left:6px; font-size:12.5px; }
+.overlay .ov-meta { display:flex; gap:10px; flex-wrap:wrap; margin:6px 0 14px; font-family:var(--mono); font-size:12px; color:var(--muted); }
+.overlay .ov-meta b { color:var(--green); }
+.overlay .progress { height:14px; margin-bottom:14px; }
+.overlay .ov-log {
+  height:220px; overflow:auto; background:#000; border:1px solid var(--line2); border-radius:10px;
+  padding:12px; font-family:var(--mono); font-size:11.5px; line-height:1.6; color:var(--soft);
+}
+.overlay .ov-log .logline .msg::before { content:"$ "; color:var(--dim); }
+.overlay .ov-footer { display:flex; gap:10px; align-items:center; justify-content:space-between; margin-top:14px; }
+.overlay .ov-footer small { color:var(--muted); font-family:var(--mono); font-size:11px; }
+
 @media (max-width:860px) {
   .grid { grid-template-columns:1fr; }
   .process { position:static; }
   .videos { max-height:300px; }
   .logbox { height:220px; }
-  h1 { font-size:18px; }
-  .shell { padding:20px 16px 50px; }
+  .overlay .ov-log { height:160px; }
 }
 @media (max-width:480px) {
   .shell { padding:16px 12px 40px; }
-  .card { padding:16px; border-radius:12px; }
+  .card { padding:15px; }
   .videos { grid-template-columns:1fr; }
-  .hero { grid-template-columns:1fr; margin-bottom:16px; }
-  .status-strip { justify-content:flex-start; }
 }
 </style>
 </head>
 <body>
+<canvas id="matrix"></canvas>
 <div class="shell">
-  <header class="hero">
-    <div class="brand">
-      <div class="logo">▶</div>
-      <div>
-        <h1>YouTube Downloader</h1>
-        <p class="sub">Fast fetch, live backend process, video/audio download, ZIP for bulk items.</p>
+
+  <div class="banner">
+    <div class="banner-top">
+      <div class="brand">
+        <div class="logo">▶</div>
+        <div>
+          <h1>ytdl<span>://</span> downloader</h1>
+          <p>paste · probe · extract · package</p>
+        </div>
+      </div>
+      <div class="status-strip">
+        <span class="pill ok">session live</span>
+        <span class="pill" id="activeJobPill">idle</span>
+        <button id="btnTheme" class="ghost sm" type="button" title="Toggle theme">◐ theme</button>
       </div>
     </div>
-    <div class="status-strip">
-      <span class="pill ok">Local web app</span>
-      <span class="pill" id="activeJobPill">Idle</span>
-      <button id="btnTheme" class="ghost sm" type="button" title="Toggle light/dark" aria-label="Toggle theme">🌙</button>
-    </div>
-  </header>
+  </div>
 
   <main class="grid">
     <section>
       <div class="card">
-        <h2>1 · Cookies (optional but recommended)</h2>
-        <p class="hint">YouTube often asks to confirm you're not a bot, or blocks private/age-restricted videos. A fresh <code>cookies.txt</code> from your signed-in browser fixes almost every "sign in / bot" error.</p>
-        <ol class="steps">
-          <li>Install the free extension: <a href="https://chromewebstore.google.com/detail/get-cookiestxt-locally/cclelndahbckbenkjhflpdbgdldlbecc" target="_blank" rel="noopener"><b>Get cookies.txt LOCALLY</b></a> (works on Chrome, Edge, Brave).</li>
-          <li>Open <a href="https://www.youtube.com" target="_blank" rel="noopener">youtube.com</a> in the <b>same browser</b> and make sure you're signed in.</li>
-          <li>Click the extension icon → <b>Export</b> (or <b>Download</b>) → save <code>youtube.com_cookies.txt</code>.</li>
-          <li>Upload that file below. Re-export if YouTube starts asking again (cookies expire).</li>
-        </ol>
-        <div class="row" style="margin-top:12px">
-          <input class="file-input" type="file" id="cookieFile" accept=".txt"/>
-          <button id="btnUpload" class="ghost">Upload cookies</button>
-          <span id="cookieStatus" class="pill warn">No cookies</span>
+        <h2>01 · cookies (optional)</h2>
+        <p class="hint">Bypass "Sign in to confirm you're not a bot" — export cookies from a signed-in browser session and drop the file here.</p>
+        <label class="drop" id="cookieDrop" for="cookieFile">
+          <div class="drop-icon">⇪</div>
+          <div id="dropText"><b style="color:var(--soft)">drag &amp; drop</b> your <code>cookies.txt</code> here, or click to browse</div>
+          <span class="drop-hint">Netscape / Mozilla format · exported from browser extension</span>
+          <input type="file" id="cookieFile" accept=".txt"/>
+        </label>
+        <div class="row" style="margin-top:10px">
+          <span id="cookieStatus" class="pill warn">no cookies</span>
+          <button id="btnClearCookies" class="ghost sm" type="button">clear</button>
         </div>
+        <ol class="steps">
+          <li>Install ext: <a href="https://chromewebstore.google.com/detail/get-cookiestxt-locally/cclelndahbckbenkjhflpdbgdldlbecc" target="_blank" rel="noopener"><b>Get cookies.txt LOCALLY</b></a></li>
+          <li>Open <a href="https://www.youtube.com" target="_blank" rel="noopener">youtube.com</a> (signed in) → click ext → Export</li>
+          <li>Drop the exported file above</li>
+        </ol>
       </div>
 
       <div class="card">
-        <h2>2 · Paste link(s)</h2>
-        <textarea id="url" placeholder="Paste one video, multiple videos, or playlist URL. For multiple links use comma, space, or new line."></textarea>
+        <h2>02 · paste link(s)</h2>
+        <textarea id="url" placeholder="paste video / playlist url(s) — separate multiple by comma, space or newline"></textarea>
         <div class="row" style="margin-top:12px">
-          <button id="btnFetch">Fetch videos</button>
-          <button id="btnClear" class="ghost" type="button">Clear</button>
-          <span id="fetchStatus" class="pill">Waiting</span>
+          <button id="btnFetch" class="primary" type="button">▶ fetch</button>
+          <button id="btnClear" class="ghost" type="button">clear</button>
+          <span id="fetchStatus" class="pill">waiting</span>
         </div>
         <div id="fetchErr" class="err"></div>
       </div>
 
       <div class="card hidden" id="optionsCard">
-        <h2>3 · Select items &amp; output</h2>
+        <h2>03 · select items &amp; format</h2>
         <div id="meta" style="margin-bottom:10px"></div>
         <div class="videos-toolbar">
-          <button type="button" class="ghost sm" id="btnSelectAll">Select all</button>
-          <button type="button" class="ghost sm" id="btnSelectNone">Clear</button>
+          <button type="button" class="ghost sm" id="btnSelectAll">select all</button>
+          <button type="button" class="ghost sm" id="btnSelectNone">clear</button>
           <span class="count" id="selCount">0 selected</span>
         </div>
         <div class="videos" id="videos"></div>
-        <div class="row" style="margin-top:14px">
+        <div class="row" style="margin-top:16px">
           <div style="flex:1;min-width:160px">
-            <label>Download type</label>
+            <label>output type</label>
             <select id="mediaType">
-              <option value="video">Video + Audio (mp4)</option>
-              <option value="audio">Audio only (mp3)</option>
+              <option value="video">video + audio (mp4)</option>
+              <option value="audio">audio only (mp3)</option>
             </select>
           </div>
           <div style="flex:1;min-width:160px" id="resWrap">
-            <label>Quality</label>
+            <label>quality</label>
             <select id="resolution"></select>
           </div>
         </div>
-        <div class="row" style="margin-top:14px">
-          <button id="btnDownload" class="secondary">Start download</button>
+        <div class="row" style="margin-top:16px">
+          <button id="btnDownload" class="primary" type="button">▼ initiate download</button>
         </div>
       </div>
 
       <div class="card hidden" id="progCard">
-        <h2>4 · Download progress</h2>
-        <div id="progText" class="stage" style="margin-bottom:8px">Starting…</div>
+        <h2>04 · download progress</h2>
+        <div id="progText" class="stage" style="margin-bottom:10px">starting…</div>
         <div class="progress"><div class="bar" id="progBar" style="width:0%"></div></div>
-        <div id="progFile" style="font-size:12px;color:var(--muted);margin-top:8px"></div>
+        <div id="progFile" style="font-size:12px;color:var(--dim);margin-top:10px;font-family:var(--mono)"></div>
         <div id="results"></div>
       </div>
     </section>
 
     <aside class="card process">
       <div class="process-head">
-        <h2 style="margin:0">Backend process</h2>
-        <span class="pill" id="processState">Idle</span>
+        <h2 style="margin:0;border:none;padding:0">stdout · backend</h2>
+        <span class="pill" id="processState">idle</span>
       </div>
       <div class="quick">
-        <div class="metric"><b id="metricStage">—</b><span>Stage</span></div>
-        <div class="metric"><b id="metricPct">0%</b><span>Progress</span></div>
-        <div class="metric"><b id="metricEta">—</b><span>ETA</span></div>
+        <div class="metric"><b id="metricStage">—</b><span>stage</span></div>
+        <div class="metric"><b id="metricPct">0%</b><span>progress</span></div>
+        <div class="metric"><b id="metricEta">—</b><span>eta</span></div>
       </div>
-      <div style="height:10px"></div>
-      <div class="logbox" id="logbox"><div class="emptylog">Backend messages will appear here while fetching/downloading.</div></div>
+      <div style="height:12px"></div>
+      <div class="logbox" id="logbox"><div class="emptylog">awaiting stdout stream from yt-dlp process…</div></div>
     </aside>
+
   </main>
-  <div class="footer">Powered by yt-dlp. Keep this browser tab open while a job is running.</div>
+
+  <section class="card" id="libraryCard">
+    <div class="process-head">
+      <h2 style="margin:0;border:none;padding:0">05 · downloaded files</h2>
+      <div class="row" style="gap:6px">
+        <span class="pill" id="libCount">0 files</span>
+        <button class="ghost sm" id="btnRefreshLib" type="button">refresh</button>
+      </div>
+    </div>
+    <div id="libraryList" class="lib-grid"><div class="emptylog">vault empty. completed downloads will materialize here.</div></div>
+  </section>
+
+  <div class="footer">powered by yt-dlp · keep tab open while jobs run</div>
+
+  <!-- PROCESSING OVERLAY -->
+  <div class="overlay" id="overlay" aria-hidden="true">
+    <div class="box">
+      <div class="ov-head">
+        <div class="spinner" id="ovSpinner"></div>
+        <div>
+          <h3 id="ovTitle">working<span id="ovSub"> · initializing</span></h3>
+        </div>
+      </div>
+      <div class="ov-meta">
+        <span>stage: <b id="ovStage">—</b></span>
+        <span>eta: <b id="ovEta">—</b></span>
+        <span>speed: <b id="ovSpeed">—</b></span>
+        <span>file: <b id="ovFile">—</b></span>
+      </div>
+      <div class="progress"><div class="bar" id="ovBar" style="width:0%"></div></div>
+      <div class="ov-log" id="ovLog"><div class="emptylog">connecting to backend…</div></div>
+      <div class="ov-footer">
+        <small>live process stream — window unblurs on completion</small>
+        <button class="ghost sm" id="ovMinimize" type="button">minimize</button>
+      </div>
+    </div>
+  </div>
 </div>
 
 <script>
-const $ = s => document.querySelector(s);
-let state = { cookies_file: "", probe: null, activeJob: "" };
+(function(){
+  "use strict";
+  const $ = s => document.querySelector(s);
+  const state = { cookies_file: "", probe: null, activeJob: "", minimized:false };
 
-// ---- theme toggle (persists in localStorage) ----
-(function initTheme() {
-  try {
-    const saved = localStorage.getItem("ytdl_theme");
-    const prefersDark = window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches;
-    const theme = saved || (prefersDark ? "dark" : "light");
-    document.documentElement.setAttribute("data-theme", theme);
-  } catch(_){}
-})();
-function applyTheme(t) {
-  document.documentElement.setAttribute("data-theme", t);
-  try { localStorage.setItem("ytdl_theme", t); } catch(_){}
-  const btn = document.getElementById("btnTheme");
-  if (btn) btn.textContent = t === "dark" ? "☀" : "🌙";
-}
-document.addEventListener("DOMContentLoaded", () => {
-  const cur = document.documentElement.getAttribute("data-theme") || "light";
-  applyTheme(cur);
-  const btn = document.getElementById("btnTheme");
-  if (btn) btn.onclick = () => applyTheme(document.documentElement.getAttribute("data-theme") === "dark" ? "light" : "dark");
-});
+  function escapeHtml(s) { return String(s ?? "").replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+  function fmtDur(s) { if(!s) return ""; s=Math.round(s); const h=Math.floor(s/3600), m=Math.floor((s%3600)/60), ss=s%60; return h ? `${h}:${m.toString().padStart(2,"0")}:${ss.toString().padStart(2,"0")}` : `${m}:${ss.toString().padStart(2,"0")}`; }
+  function fmtSpeed(b) { if(!b) return "—"; if(b>1e6) return (b/1e6).toFixed(1)+" MB/s"; if(b>1e3) return (b/1e3).toFixed(0)+" KB/s"; return b+" B/s"; }
+  function fmtEta(s) { if(!s) return "—"; if(s<60) return s+"s"; const m=Math.floor(s/60); return m+"m "+(s%60)+"s"; }
 
-async function api(path, opts={}) {
-  const r = await fetch(path, opts);
-  const j = await r.json().catch(() => ({}));
-  if (!r.ok) throw new Error(j.error || ("HTTP "+r.status));
-  return j;
-}
-
-function setBusy(label, kind="") {
-  $("#activeJobPill").textContent = label;
-  $("#processState").textContent = label;
-  $("#activeJobPill").className = kind ? "pill " + kind : "pill";
-  $("#processState").className = kind ? "pill " + kind : "pill";
-}
-
-function renderLogs(logs=[]) {
-  const box = $("#logbox");
-  if (!logs.length) {
-    box.innerHTML = `<div class="emptylog">Waiting for backend messages…</div>`;
-    return;
+  async function api(path, opts={}) {
+    const r = await fetch(path, opts);
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(j.error || ("HTTP "+r.status));
+    return j;
   }
-  box.innerHTML = logs.map(l => `<div class="logline ${escapeHtml(l.level||"")}"><span class="time">${escapeHtml(l.time||"")}</span><span class="msg">${escapeHtml(l.message||"")}</span></div>`).join("");
-  box.scrollTop = box.scrollHeight;
-}
 
-function renderProcess(j, pct) {
-  const progress = Math.max(0, Math.min(100, pct ?? j.progress ?? j.current_pct ?? 0));
-  $("#metricStage").textContent = j.stage || j.status || "—";
-  $("#metricPct").textContent = progress.toFixed(0) + "%";
-  $("#metricEta").textContent = fmtEta(j.eta);
-  renderLogs(j.log || []);
-}
-
-$("#btnUpload").onclick = async () => {
-  const f = $("#cookieFile").files[0];
-  if (!f) { $("#cookieStatus").textContent = "Pick a file first"; return; }
-  const fd = new FormData(); fd.append("file", f);
-  $("#cookieStatus").textContent = "Uploading…";
-  $("#cookieStatus").className = "pill warn";
-  try {
-    const j = await api("/api/cookies", { method:"POST", body: fd });
-    state.cookies_file = j.cookies_file;
-    $("#cookieStatus").textContent = "Loaded " + j.name;
-    $("#cookieStatus").className = "pill ok";
-  } catch (e) {
-    $("#cookieStatus").textContent = e.message;
-    $("#cookieStatus").className = "pill err";
-  }
-};
-
-$("#btnClear").onclick = () => {
-  $("#url").value = "";
-  $("#fetchErr").textContent = "";
-  $("#fetchStatus").textContent = "Waiting";
-};
-
-$("#btnFetch").onclick = async () => {
-  const url = $("#url").value.trim();
-  if (!url) return;
-  $("#fetchErr").textContent = "";
-  $("#optionsCard").classList.add("hidden");
-  $("#fetchStatus").textContent = "Starting…";
-  $("#fetchStatus").className = "pill warn";
-  $("#btnFetch").disabled = true;
-  setBusy("Fetching", "warn");
-  renderLogs([{time:new Date().toLocaleTimeString(), level:"info", message:"Sending fetch job to backend…"}]);
-  try {
-    const { job_id } = await api("/api/probe", {
-      method:"POST",
-      headers:{"Content-Type":"application/json"},
-      body: JSON.stringify({ url, cookies_file: state.cookies_file })
-    });
-    state.activeJob = job_id;
-    await pollProbe(job_id);
-  } catch (e) {
-    $("#fetchErr").textContent = e.message;
-    $("#fetchStatus").textContent = "Failed";
-    $("#fetchStatus").className = "pill err";
-    setBusy("Failed", "err");
-  } finally {
-    $("#btnFetch").disabled = false;
-  }
-};
-
-async function pollProbe(id) {
-  while (true) {
-    await new Promise(r => setTimeout(r, 750));
-    let j;
-    try { j = await api("/api/job/" + id); } catch { continue; }
-    renderProcess(j, j.progress || 0);
-    $("#fetchStatus").textContent = `${j.stage || j.status} · ${Math.round(j.progress || 0)}%`;
-    if (j.status === "probe_done") {
-      state.probe = j.probe;
-      renderProbe(j.probe);
-      $("#fetchStatus").textContent = "Ready";
-      $("#fetchStatus").className = "pill ok";
-      setBusy("Ready", "ok");
-      break;
+  // ---------- matrix rain background ----------
+  (function matrix(){
+    const c = $("#matrix"); if(!c) return;
+    const ctx = c.getContext("2d");
+    let w, h, cols, drops, fontSize = 15;
+    const chars = "01アイウエオカキクケコサシスセソタチツテトナニヌネノABCDEF{}<>/_$#@";
+    function resize() {
+      w = c.width = window.innerWidth;
+      h = c.height = window.innerHeight;
+      cols = Math.floor(w / fontSize);
+      drops = new Array(cols).fill(0).map(() => Math.random() * -50);
     }
-    if (j.status === "error") {
-      $("#fetchErr").textContent = j.error || "Fetch failed";
-      $("#fetchStatus").textContent = "Failed";
-      $("#fetchStatus").className = "pill err";
-      setBusy("Failed", "err");
-      break;
+    resize(); window.addEventListener("resize", resize);
+    function draw() {
+      ctx.fillStyle = "rgba(5,8,10,0.08)";
+      ctx.fillRect(0, 0, w, h);
+      ctx.font = fontSize + "px JetBrains Mono, monospace";
+      for (let i=0; i<cols; i++) {
+        const ch = chars[Math.floor(Math.random()*chars.length)];
+        const y = drops[i] * fontSize;
+        // head
+        ctx.fillStyle = "rgba(180,255,200,0.9)";
+        ctx.fillText(ch, i*fontSize, y);
+        // trail
+        ctx.fillStyle = "rgba(57,255,20,0.55)";
+        ctx.fillText(ch, i*fontSize, y);
+        if (y > h && Math.random() > 0.975) drops[i] = 0;
+        drops[i] += 1;
+      }
+    }
+    setInterval(draw, 55);
+  })();
+
+  // ---------- busy overlay ----------
+  function setBusyMode(on, title="working", sub="") {
+    document.body.classList.toggle("busy", !!on && !state.minimized);
+    if (on) {
+      $("#overlay").setAttribute("aria-hidden","false");
+      $("#ovTitle").firstChild.nodeValue = title;
+      $("#ovSub").textContent = sub ? " · " + sub : "";
+    } else {
+      state.minimized = false;
+      $("#overlay").setAttribute("aria-hidden","true");
     }
   }
-}
 
-function renderProbe(j) {
-  $("#optionsCard").classList.remove("hidden");
-  const modeLabel = j.mode === "playlist" ? "Playlist" : j.mode === "multiple" ? "Multiple videos" : "Single video";
-  $("#meta").innerHTML = `<span class="pill ok">${modeLabel}</span> <span class="pill">${j.videos.length} item(s)</span> <b>${escapeHtml(j.title)}</b>`;
-  $("#videos").innerHTML = j.videos.map((v, i) => `
-    <label class="vid selected" data-idx="${i}">
-      <input type="checkbox" checked data-idx="${i}"/>
-      ${v.thumbnail ? `<img src="${escapeHtml(v.thumbnail)}" onerror="this.replaceWith(Object.assign(document.createElement('div'),{className:'thumb'}))"/>` : `<div class="thumb"></div>`}
-      <div class="t"><b>${escapeHtml(v.title)}</b><span>${v.duration ? fmtDur(v.duration) : escapeHtml(v.url || "")}</span></div>
-    </label>`).join("");
-  $("#videos").querySelectorAll('input[type=checkbox]').forEach(cb => {
-    cb.addEventListener("change", () => {
-      cb.closest(".vid").classList.toggle("selected", cb.checked);
-      updateSelCount();
+  function setBusy(label, kind="") {
+    const L = label.toLowerCase();
+    $("#activeJobPill").textContent = L;
+    $("#processState").textContent = L;
+    $("#activeJobPill").className = kind ? "pill " + kind : "pill";
+    $("#processState").className = kind ? "pill " + kind : "pill";
+  }
+
+  function renderLogs(logs=[]) {
+    const html = !logs.length
+      ? `<div class="emptylog">awaiting stdout…</div>`
+      : logs.map(l => `<div class="logline ${escapeHtml(l.level||"")}"><span class="time">${escapeHtml(l.time||"")}</span><span class="msg">${escapeHtml(l.message||"")}</span></div>`).join("");
+    const box = $("#logbox"); box.innerHTML = html; box.scrollTop = box.scrollHeight;
+    const ov = $("#ovLog"); if (ov) { ov.innerHTML = html; ov.scrollTop = ov.scrollHeight; }
+  }
+
+  function renderProcess(j, pct) {
+    const progress = Math.max(0, Math.min(100, pct ?? j.progress ?? j.current_pct ?? 0));
+    $("#metricStage").textContent = j.stage || j.status || "—";
+    $("#metricPct").textContent = progress.toFixed(0) + "%";
+    $("#metricEta").textContent = fmtEta(j.eta);
+    $("#ovStage").textContent = j.stage || j.status || "—";
+    $("#ovEta").textContent = fmtEta(j.eta);
+    $("#ovSpeed").textContent = fmtSpeed(j.speed);
+    $("#ovFile").textContent = (j.current_file || "—").split("/").pop() || "—";
+    $("#ovBar").style.width = progress.toFixed(1) + "%";
+    $("#ovSub").textContent = " · " + progress.toFixed(0) + "%";
+    renderLogs(j.log || []);
+  }
+
+  // ---- theme ----
+  function applyTheme(t) {
+    document.documentElement.setAttribute("data-theme", t);
+    try { localStorage.setItem("ytdl_theme", t); } catch(_){}
+    const btn = $("#btnTheme"); if (btn) btn.textContent = t === "dark" ? "◐ light" : "◐ dark";
+  }
+  (function initTheme(){
+    let saved = "dark";
+    try { saved = localStorage.getItem("ytdl_theme") || "dark"; } catch(_){}
+    applyTheme(saved);
+  })();
+
+  // ---- selection helpers ----
+  function selectedIndices() {
+    return Array.from($("#videos").querySelectorAll('input[type=checkbox]'))
+      .map((cb, i) => cb.checked ? i : -1).filter(i => i >= 0);
+  }
+  function updateSelCount() {
+    const n = selectedIndices().length;
+    const total = state.probe ? state.probe.videos.length : 0;
+    $("#selCount").textContent = `${n} / ${total} selected`;
+  }
+  function setAllChecked(v) {
+    $("#videos").querySelectorAll('input[type=checkbox]').forEach(cb => {
+      cb.checked = v; cb.closest(".vid").classList.toggle("selected", v);
     });
-  });
-  updateSelCount();
-  const res = $("#resolution");
-  const choices = (j.resolutions || []).filter(r => r <= 4320).sort((a,b)=>a-b);
-  res.innerHTML = `<option value="0">Best available</option>` + choices.map(r => `<option value="${r}">${r}p</option>`).join("");
-  if (choices.includes(720)) res.value = "720";
-}
-
-function selectedIndices() {
-  return Array.from($("#videos").querySelectorAll('input[type=checkbox]'))
-    .map((cb, i) => cb.checked ? i : -1).filter(i => i >= 0);
-}
-function updateSelCount() {
-  const n = selectedIndices().length;
-  const total = state.probe ? state.probe.videos.length : 0;
-  $("#selCount").textContent = `${n} / ${total} selected`;
-}
-function setAllChecked(v) {
-  $("#videos").querySelectorAll('input[type=checkbox]').forEach(cb => {
-    cb.checked = v; cb.closest(".vid").classList.toggle("selected", v);
-  });
-  updateSelCount();
-}
-$("#btnSelectAll").onclick = () => setAllChecked(true);
-$("#btnSelectNone").onclick = () => setAllChecked(false);
-
-function toPlaylistItems(indices) {
-  // indices are 0-based; yt-dlp playlist_items is 1-based, supports "1,3,5-7"
-  if (!indices.length) return "";
-  const nums = indices.map(i => i + 1).sort((a,b)=>a-b);
-  const out = []; let start = nums[0], prev = nums[0];
-  for (let i = 1; i < nums.length; i++) {
-    if (nums[i] === prev + 1) { prev = nums[i]; continue; }
+    updateSelCount();
+  }
+  function toPlaylistItems(indices) {
+    if (!indices.length) return "";
+    const nums = indices.map(i => i + 1).sort((a,b)=>a-b);
+    const out = []; let start = nums[0], prev = nums[0];
+    for (let i = 1; i < nums.length; i++) {
+      if (nums[i] === prev + 1) { prev = nums[i]; continue; }
+      out.push(start === prev ? `${start}` : `${start}-${prev}`);
+      start = prev = nums[i];
+    }
     out.push(start === prev ? `${start}` : `${start}-${prev}`);
-    start = prev = nums[i];
+    return out.join(",");
   }
-  out.push(start === prev ? `${start}` : `${start}-${prev}`);
-  return out.join(",");
-}
 
-$("#mediaType").onchange = () => {
-  $("#resWrap").style.display = $("#mediaType").value === "audio" ? "none" : "";
-};
-
-$("#btnDownload").onclick = async () => {
-  if (!state.probe) return;
-  const p = state.probe;
-  const idx = selectedIndices();
-  if (!idx.length) { alert("Select at least one item to download."); return; }
-  let urls, playlist_items = "";
-  if (p.mode === "playlist") {
-    urls = [p.urls[0]];
-    playlist_items = toPlaylistItems(idx);
-  } else {
-    urls = idx.map(i => p.videos[i].url).filter(Boolean);
-  }
-  const payload = {
-    mode: p.mode,
-    media_type: $("#mediaType").value,
-    resolution: parseInt($("#resolution").value || "0", 10),
-    urls, playlist_items,
-    total_items: idx.length,
-    title: p.title,
-    cookies_file: state.cookies_file,
-  };
-  $("#btnDownload").disabled = true;
-  $("#progCard").classList.remove("hidden");
-  $("#progText").textContent = "Queued…";
-  $("#progBar").style.width = "0%";
-  $("#results").innerHTML = "";
-  setBusy("Downloading", "warn");
-  renderLogs([{time:new Date().toLocaleTimeString(), level:"info", message:"Sending download job to backend…"}]);
-  try {
-    const { job_id } = await api("/api/download", {
-      method:"POST", headers:{"Content-Type":"application/json"},
-      body: JSON.stringify(payload)
+  function renderProbe(j) {
+    $("#optionsCard").classList.remove("hidden");
+    const modeLabel = j.mode === "playlist" ? "playlist" : j.mode === "multiple" ? "multi" : "single";
+    $("#meta").innerHTML = `<span class="pill ok">${modeLabel}</span> <span class="pill">${j.videos.length} item(s)</span> <b style="color:var(--soft);margin-left:6px">${escapeHtml(j.title)}</b>`;
+    $("#videos").innerHTML = j.videos.map((v, i) => `
+      <label class="vid selected" data-idx="${i}">
+        <input type="checkbox" checked data-idx="${i}"/>
+        ${v.thumbnail ? `<img src="${escapeHtml(v.thumbnail)}" onerror="this.replaceWith(Object.assign(document.createElement('div'),{className:'thumb'}))"/>` : `<div class="thumb"></div>`}
+        <div class="t"><b>${escapeHtml(v.title)}</b><span>${v.duration ? fmtDur(v.duration) : escapeHtml(v.url || "")}</span></div>
+      </label>`).join("");
+    $("#videos").querySelectorAll('input[type=checkbox]').forEach(cb => {
+      cb.addEventListener("change", () => {
+        cb.closest(".vid").classList.toggle("selected", cb.checked);
+        updateSelCount();
+      });
     });
-    state.activeJob = job_id;
-    pollJob(job_id);
-  } catch (e) {
-    $("#progText").textContent = "Error: " + e.message;
-    setBusy("Failed", "err");
+    updateSelCount();
+    const res = $("#resolution");
+    const choices = (j.resolutions || []).filter(r => r <= 4320).sort((a,b)=>a-b);
+    res.innerHTML = `<option value="0">best available</option>` + choices.map(r => `<option value="${r}">${r}p</option>`).join("");
+    if (choices.includes(720)) res.value = "720";
+  }
+
+  async function pollProbe(id) {
+    while (true) {
+      await new Promise(r => setTimeout(r, 750));
+      let j;
+      try { j = await api("/api/job/" + id); } catch { continue; }
+      renderProcess(j, j.progress || 0);
+      $("#fetchStatus").textContent = `${j.stage || j.status} · ${Math.round(j.progress || 0)}%`;
+      if (j.status === "probe_done") {
+        state.probe = j.probe;
+        renderProbe(j.probe);
+        $("#fetchStatus").textContent = "ready";
+        $("#fetchStatus").className = "pill ok";
+        setBusy("ready", "ok");
+        setBusyMode(false);
+        break;
+      }
+      if (j.status === "error") {
+        $("#fetchErr").textContent = j.error || "Fetch failed";
+        $("#fetchStatus").textContent = "failed";
+        $("#fetchStatus").className = "pill err";
+        setBusy("failed", "err");
+        setBusyMode(false);
+        break;
+      }
+    }
+  }
+
+  async function pollJob(id) {
+    while (true) {
+      await new Promise(r => setTimeout(r, 800));
+      let j;
+      try { j = await api("/api/job/" + id); } catch { continue; }
+      const totalItems = Math.max(1, j.total_items || 1);
+      const done = Math.max(0, j.completed_items || 0);
+      const overall = j.status === "done" ? 100 : Math.min(99, ((done + (j.current_pct||0)/100) / totalItems) * 100);
+      $("#progBar").style.width = overall.toFixed(1) + "%";
+      renderProcess(j, overall);
+      const filesTxt = totalItems > 1 ? ` · file ${Math.min(done+1, totalItems)}/${totalItems}` : "";
+      $("#progText").textContent =
+        j.status === "running"
+          ? `${j.stage || "downloading"} · ${overall.toFixed(1)}%${filesTxt} · ${fmtSpeed(j.speed)} · eta ${fmtEta(j.eta)}`
+          : j.status === "queued" ? "queued…"
+          : j.status === "done"   ? "complete ✓"
+          : j.status === "error"  ? (j.error||"download failed") : j.status;
+      $("#progFile").textContent = j.current_file ? "> " + j.current_file : "";
+      if (j.status === "done") { renderLinks(j.links || []); setBusy("complete", "ok"); setBusyMode(false); break; }
+      if (j.status === "error") { setBusy("failed", "err"); setBusyMode(false); $("#btnDownload").disabled = false; break; }
+    }
+  }
+
+  function renderLinks(links) {
+    if (!links.length) {
+      $("#results").innerHTML = `<div class="err">// no files produced. inspect stdout above for cause.</div>`;
+      return;
+    }
+    $("#results").innerHTML = `<div class="link-card">
+      <div style="font-weight:700;margin-bottom:8px;color:var(--green)">▼ transfer complete — click to save</div>
+      ${links.map(l => `
+        <div style="margin:8px 0">
+          <a href="${l.url}" download>${escapeHtml(l.name)}</a>
+          <span class="pill">${l.size_mb} MB</span>
+          ${l.is_zip ? `<span class="pill ok">zip · ${l.file_count} files</span>` : ""}
+        </div>`).join("")}
+    </div>`;
     $("#btnDownload").disabled = false;
+    refreshLibrary();
   }
-};
 
-async function pollJob(id) {
-  while (true) {
-    await new Promise(r => setTimeout(r, 800));
-    let j;
-    try { j = await api("/api/job/" + id); } catch { continue; }
-    const totalItems = Math.max(1, j.total_items || 1);
-    const done = Math.max(0, j.completed_items || 0);
-    const overall = j.status === "done" ? 100 : Math.min(99, ((done + (j.current_pct||0)/100) / totalItems) * 100);
-    $("#progBar").style.width = overall.toFixed(1) + "%";
-    renderProcess(j, overall);
-    const filesTxt = totalItems > 1 ? ` · file ${Math.min(done+1, totalItems)}/${totalItems}` : "";
-    $("#progText").textContent =
-      j.status === "running"
-        ? `${j.stage || "Downloading"} · ${overall.toFixed(1)}%${filesTxt} · ${fmtSpeed(j.speed)} · ETA ${fmtEta(j.eta)}`
-        : j.status === "queued" ? "Queued…"
-        : j.status === "done"   ? "Complete"
-        : j.status === "error"  ? (j.error||"Download failed") : j.status;
-    $("#progFile").textContent = j.current_file ? "Current: " + j.current_file : "";
-    if (j.status === "done") { renderLinks(j.links || []); setBusy("Complete", "ok"); break; }
-    if (j.status === "error") { setBusy("Failed", "err"); $("#btnDownload").disabled = false; break; }
+  async function refreshLibrary() {
+    try {
+      const j = await api("/api/files");
+      renderLibrary(j.files || []);
+    } catch (e) {
+      $("#libraryList").innerHTML = `<div class="err">${escapeHtml(e.message)}</div>`;
+    }
   }
-}
-
-function renderLinks(links) {
-  if (!links.length) {
-    $("#results").innerHTML = `<div class="err">No files were produced. Check the backend process log above for the exact reason.</div>`;
-    return;
+  function renderLibrary(files) {
+    $("#libCount").textContent = files.length + " file" + (files.length===1?"":"s");
+    if (!files.length) {
+      $("#libraryList").innerHTML = `<div class="emptylog">vault empty. completed downloads will materialize here.</div>`;
+      return;
+    }
+    $("#libraryList").innerHTML = files.map(f => `
+      <div class="lib-item" data-path="${escapeHtml(f.path)}">
+        <div class="lib-name">${escapeHtml(f.name)}</div>
+        <div class="row" style="gap:6px">
+          <span class="pill ${f.is_zip?'ok':''}">${escapeHtml(f.kind)}</span>
+          <span class="pill">${f.size_mb} MB</span>
+        </div>
+        <div class="lib-actions">
+          <a class="lib-dl" href="${f.url}" download>download</a>
+          <button class="ghost sm lib-del" type="button" data-path="${escapeHtml(f.path)}">rm</button>
+        </div>
+      </div>`).join("");
+    $("#libraryList").querySelectorAll(".lib-del").forEach(btn => {
+      btn.onclick = async () => {
+        const p = btn.getAttribute("data-path");
+        if (!confirm("rm -f " + p + " ?")) return;
+        btn.disabled = true;
+        try {
+          const j = await fetch("/api/files", {
+            method:"DELETE", headers:{"Content-Type":"application/json"},
+            body: JSON.stringify({ path: p })
+          }).then(r => r.json());
+          if (j.error) throw new Error(j.error);
+          renderLibrary(j.files || []);
+        } catch (e) { alert("delete failed: " + e.message); btn.disabled = false; }
+      };
+    });
   }
-  $("#results").innerHTML = `<div class="link-card">
-    <div style="font-weight:700;margin-bottom:8px">Ready — click to save to your PC</div>
-    ${links.map(l => `
-      <div style="margin:8px 0">
-        <a href="${l.url}" download>${escapeHtml(l.name)}</a>
-        <span class="pill">${l.size_mb} MB</span>
-        ${l.is_zip ? `<span class="pill ok">ZIP · ${l.file_count} files</span>` : ""}
-      </div>`).join("")}
-  </div>`;
-  $("#btnDownload").disabled = false;
-}
 
-function escapeHtml(s) { return String(s ?? "").replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
-function fmtDur(s) { if(!s) return ""; s=Math.round(s); const h=Math.floor(s/3600), m=Math.floor((s%3600)/60), ss=s%60; return h ? `${h}:${m.toString().padStart(2,"0")}:${ss.toString().padStart(2,"0")}` : `${m}:${ss.toString().padStart(2,"0")}`; }
-function fmtSpeed(b) { if(!b) return "—"; if(b>1e6) return (b/1e6).toFixed(1)+" MB/s"; if(b>1e3) return (b/1e3).toFixed(0)+" KB/s"; return b+" B/s"; }
-function fmtEta(s) { if(!s) return "—"; if(s<60) return s+"s"; const m=Math.floor(s/60); return m+"m "+(s%60)+"s"; }
+  // ---------- cookie upload (drag + click) ----------
+  async function uploadCookieFile(f) {
+    if (!f) return;
+    const fd = new FormData(); fd.append("file", f);
+    $("#cookieStatus").textContent = "uploading…";
+    $("#cookieStatus").className = "pill warn";
+    try {
+      const j = await api("/api/cookies", { method:"POST", body: fd });
+      state.cookies_file = j.cookies_file;
+      $("#cookieStatus").textContent = "loaded · " + j.name;
+      $("#cookieStatus").className = "pill ok";
+      $("#dropText").innerHTML = `<b style="color:var(--green)">✓ ${escapeHtml(j.name)}</b> loaded — drop another to replace`;
+    } catch (e) {
+      $("#cookieStatus").textContent = e.message;
+      $("#cookieStatus").className = "pill err";
+    }
+  }
+
+  function bind() {
+    const btnTheme = $("#btnTheme");
+    if (btnTheme) btnTheme.onclick = () => applyTheme(document.documentElement.getAttribute("data-theme") === "dark" ? "light" : "dark");
+
+    // cookie drop zone
+    const drop = $("#cookieDrop");
+    const fileInput = $("#cookieFile");
+    fileInput.addEventListener("change", () => { if (fileInput.files[0]) uploadCookieFile(fileInput.files[0]); });
+    ["dragenter","dragover"].forEach(ev => drop.addEventListener(ev, e => { e.preventDefault(); e.stopPropagation(); drop.classList.add("dragover"); }));
+    ["dragleave","drop"].forEach(ev => drop.addEventListener(ev, e => { e.preventDefault(); e.stopPropagation(); drop.classList.remove("dragover"); }));
+    drop.addEventListener("drop", e => {
+      const f = e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0];
+      if (f) uploadCookieFile(f);
+    });
+    $("#btnClearCookies").onclick = () => {
+      state.cookies_file = ""; fileInput.value = "";
+      $("#cookieStatus").textContent = "no cookies"; $("#cookieStatus").className = "pill warn";
+      $("#dropText").innerHTML = `<b style="color:var(--soft)">drag &amp; drop</b> your <code>cookies.txt</code> here, or click to browse`;
+    };
+
+    $("#btnClear").onclick = () => {
+      $("#url").value = "";
+      $("#fetchErr").textContent = "";
+      $("#fetchStatus").textContent = "waiting";
+      $("#fetchStatus").className = "pill";
+    };
+
+    $("#btnFetch").onclick = async () => {
+      const url = $("#url").value.trim();
+      if (!url) { $("#fetchErr").textContent = "// paste a url first"; return; }
+      $("#fetchErr").textContent = "";
+      $("#optionsCard").classList.add("hidden");
+      $("#fetchStatus").textContent = "starting…";
+      $("#fetchStatus").className = "pill warn";
+      $("#btnFetch").disabled = true;
+      setBusy("fetching", "warn");
+      setBusyMode(true, "fetching metadata", "probing yt-dlp");
+      renderLogs([{time:new Date().toLocaleTimeString(), level:"info", message:"dispatching fetch job → backend"}]);
+      try {
+        const { job_id } = await api("/api/probe", {
+          method:"POST",
+          headers:{"Content-Type":"application/json"},
+          body: JSON.stringify({ url, cookies_file: state.cookies_file })
+        });
+        state.activeJob = job_id;
+        await pollProbe(job_id);
+      } catch (e) {
+        $("#fetchErr").textContent = e.message;
+        $("#fetchStatus").textContent = "failed";
+        $("#fetchStatus").className = "pill err";
+        setBusy("failed", "err");
+        setBusyMode(false);
+      } finally {
+        $("#btnFetch").disabled = false;
+      }
+    };
+
+    $("#btnSelectAll").onclick = () => setAllChecked(true);
+    $("#btnSelectNone").onclick = () => setAllChecked(false);
+
+    $("#mediaType").onchange = () => {
+      $("#resWrap").style.display = $("#mediaType").value === "audio" ? "none" : "";
+    };
+
+    $("#btnDownload").onclick = async () => {
+      if (!state.probe) return;
+      const p = state.probe;
+      const idx = selectedIndices();
+      if (!idx.length) { alert("select at least one item to download."); return; }
+      let urls, playlist_items = "";
+      if (p.mode === "playlist") {
+        urls = [p.urls[0]];
+        playlist_items = toPlaylistItems(idx);
+      } else {
+        urls = idx.map(i => p.videos[i].url).filter(Boolean);
+      }
+      const payload = {
+        mode: p.mode,
+        media_type: $("#mediaType").value,
+        resolution: parseInt($("#resolution").value || "0", 10),
+        urls, playlist_items,
+        total_items: idx.length,
+        title: p.title,
+        cookies_file: state.cookies_file,
+      };
+      $("#btnDownload").disabled = true;
+      $("#progCard").classList.remove("hidden");
+      $("#progText").textContent = "queued…";
+      $("#progBar").style.width = "0%";
+      $("#results").innerHTML = "";
+      setBusy("downloading", "warn");
+      setBusyMode(true, "downloading", `${idx.length} item(s)`);
+      renderLogs([{time:new Date().toLocaleTimeString(), level:"info", message:"dispatching download job → backend"}]);
+      try {
+        const { job_id } = await api("/api/download", {
+          method:"POST", headers:{"Content-Type":"application/json"},
+          body: JSON.stringify(payload)
+        });
+        state.activeJob = job_id;
+        pollJob(job_id);
+      } catch (e) {
+        $("#progText").textContent = "error: " + e.message;
+        setBusy("failed", "err"); setBusyMode(false);
+        $("#btnDownload").disabled = false;
+      }
+    };
+
+    $("#ovMinimize").onclick = () => {
+      state.minimized = true;
+      document.body.classList.remove("busy");
+      $("#overlay").setAttribute("aria-hidden","true");
+    };
+
+    $("#btnRefreshLib").onclick = refreshLibrary;
+    refreshLibrary();
+  }
+
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", bind);
+  } else {
+    bind();
+  }
+})();
 </script>
+
 </body>
 </html>
 """
